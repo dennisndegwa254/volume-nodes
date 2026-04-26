@@ -3,7 +3,11 @@ import pandas as pd
 import numpy as np
 import time
 import requests
-import anthropic
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 from datetime import datetime, timedelta
 
 # ═══════════════════════════════════════════════════════════════
@@ -119,7 +123,9 @@ def get_ai_sentiment(pair, headlines, claude_api_key):
 
     default = {"tone":"Neutral","score":0,"intervention_risk":False,
                 "reasoning":"No API key provided — using neutral default.","pair":pair}
-    if not claude_api_key:
+    if not claude_api_key or not ANTHROPIC_AVAILABLE:
+        if not ANTHROPIC_AVAILABLE:
+            default["reasoning"] = "anthropic package not installed — add to requirements.txt"
         return default
 
     base_curr, quote_curr = pair[:3], pair[3:]
