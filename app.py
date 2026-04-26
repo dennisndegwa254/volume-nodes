@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import time
 import requests
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 try:
     import anthropic
     ANTHROPIC_AVAILABLE = True
@@ -709,6 +711,148 @@ def render_entry_signal_card(s):
           f'</div></div>')
     st.markdown(card,unsafe_allow_html=True)
 
+
+# ═══════════════════════════════════════════════════════════════
+# REAL-TIME CANDLESTICK CHART
+# ═══════════════════════════════════════════════════════════════
+def render_candlestick_chart(df, pair, poc, vah, val_p, hvn, lvn, atr_val):
+    """Full candlestick chart with Volume, VP levels, EMA20/50, ATR bands."""
+    if df.empty or len(df) < 5:
+        st.info("No candle data available for chart.")
+        return
+
+    df = df.copy().reset_index(drop=True)
+    # Limit to last 100 bars for readability
+    df = df.tail(100).reset_index(drop=True)
+
+    # Compute indicators
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["vol_color"] = df.apply(
+        lambda r: "#1a7a4a" if r["close"] >= r["open"] else "#b5281c", axis=1
+    )
+
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.75, 0.25],
+        vertical_spacing=0.03,
+    )
+
+    # ── Candlesticks ──────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=df["time"],
+        open=df["open"], high=df["high"],
+        low=df["low"],   close=df["close"],
+        name=pair,
+        increasing_line_color="#52b788",
+        decreasing_line_color="#b5281c",
+        increasing_fillcolor="#1a7a4a",
+        decreasing_fillcolor="#b5281c",
+        line_width=1,
+    ), row=1, col=1)
+
+    # ── EMA lines ─────────────────────────────────────────────
+    fig.add_trace(go.Scatter(
+        x=df["time"], y=df["ema20"],
+        mode="lines", name="EMA 20",
+        line=dict(color="#e09a2a", width=1.5, dash="solid"),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=df["time"], y=df["ema50"],
+        mode="lines", name="EMA 50",
+        line=dict(color="#7c3aed", width=1.5, dash="dot"),
+    ), row=1, col=1)
+
+    # ── VP horizontal levels ───────────────────────────────────
+    x_start = df["time"].iloc[0]
+    x_end   = df["time"].iloc[-1]
+
+    # POC
+    fig.add_shape(type="line", x0=x_start, x1=x_end, y0=poc, y1=poc,
+                  line=dict(color="#e09a2a", width=1.5, dash="dash"),
+                  row=1, col=1)
+    fig.add_annotation(x=x_end, y=poc, text=f"POC {poc:.5f}",
+                        showarrow=False, xanchor="left",
+                        font=dict(color="#e09a2a", size=9), row=1, col=1)
+
+    # VAH
+    fig.add_shape(type="line", x0=x_start, x1=x_end, y0=vah, y1=vah,
+                  line=dict(color="#52b788", width=1, dash="dash"),
+                  row=1, col=1)
+    fig.add_annotation(x=x_end, y=vah, text=f"VAH {vah:.5f}",
+                        showarrow=False, xanchor="left",
+                        font=dict(color="#52b788", size=9), row=1, col=1)
+
+    # VAL
+    fig.add_shape(type="line", x0=x_start, x1=x_end, y0=val_p, y1=val_p,
+                  line=dict(color="#52b788", width=1, dash="dash"),
+                  row=1, col=1)
+    fig.add_annotation(x=x_end, y=val_p, text=f"VAL {val_p:.5f}",
+                        showarrow=False, xanchor="left",
+                        font=dict(color="#52b788", size=9), row=1, col=1)
+
+    # Value Area fill
+    fig.add_shape(type="rect",
+                  x0=x_start, x1=x_end, y0=val_p, y1=vah,
+                  fillcolor="rgba(82,183,136,0.06)",
+                  line=dict(width=0),
+                  row=1, col=1)
+
+    # HVN lines (top 3)
+    for h in hvn[:3]:
+        fig.add_shape(type="line", x0=x_start, x1=x_end, y0=h, y1=h,
+                      line=dict(color="#1a4fa8", width=1, dash="dot"),
+                      row=1, col=1)
+
+    # LVN lines (top 3)
+    for l in lvn[:3]:
+        fig.add_shape(type="line", x0=x_start, x1=x_end, y0=l, y1=l,
+                      line=dict(color="#555555", width=0.8, dash="dot"),
+                      row=1, col=1)
+
+    # ATR bands around last close
+    last_close = float(df["close"].iloc[-1])
+    last_time  = df["time"].iloc[-1]
+    fig.add_shape(type="line",
+                  x0=last_time, x1=last_time,
+                  y0=last_close - atr_val, y1=last_close + atr_val,
+                  line=dict(color="#e07b5a", width=2),
+                  row=1, col=1)
+    fig.add_annotation(x=last_time, y=last_close + atr_val,
+                        text=f"+ATR", showarrow=False,
+                        font=dict(color="#e07b5a", size=9),
+                        xanchor="right", row=1, col=1)
+
+    # ── Volume bars ────────────────────────────────────────────
+    fig.add_trace(go.Bar(
+        x=df["time"], y=df["volume"],
+        name="Volume",
+        marker_color=df["vol_color"],
+        opacity=0.7,
+    ), row=2, col=1)
+
+    # ── Layout ─────────────────────────────────────────────────
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#0e1117",
+        height=520,
+        margin=dict(l=0, r=80, t=30, b=0),
+        legend=dict(orientation="h", y=1.02, x=0,
+                    font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+        xaxis_rangeslider_visible=False,
+        xaxis2=dict(showgrid=False),
+        yaxis=dict(gridcolor="#1e1e2e", tickfont=dict(size=9)),
+        yaxis2=dict(gridcolor="#1e1e2e", tickfont=dict(size=9)),
+        showlegend=True,
+        hovermode="x unified",
+    )
+    fig.update_xaxes(gridcolor="#1e1e2e", showgrid=True)
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
 # ═══════════════════════════════════════════════════════════════
 # 10. COUNTDOWN FRAGMENT
 # ═══════════════════════════════════════════════════════════════
@@ -772,6 +916,36 @@ if not data["use_live"]: st.caption("⚠️ Simulated — add Polygon.io key for
 st.divider()
 
 # ── Heatmap + Alerts ──────────────────────────────────────────
+# ── Real-time chart ──────────────────────────────────────────
+st.markdown("### 📈 Real-Time Candlestick Chart")
+chart_c1, chart_c2, chart_c3 = st.columns([2, 1, 1])
+with chart_c1:
+    chart_pair = st.selectbox("Pair", PAIRS, key="chart_pair")
+with chart_c2:
+    chart_tf   = st.selectbox("Timeframe", TIMEFRAMES, index=2, key="chart_tf")
+with chart_c3:
+    chart_bars  = st.slider("Bars", 50, 300, 100, 25, key="chart_bars")
+
+# Fetch candles for selected TF (may differ from H1 used for VP)
+@st.cache_data(ttl=60)
+def get_chart_candles(pair, tf, api_key, bars):
+    mult, tspan = TF_MAP[tf]
+    if api_key:
+        df = fetch_polygon_candles(pair, mult, tspan, api_key, limit=bars)
+        if not df.empty:
+            return df
+    return simulate_candles(pair, bars)
+
+chart_df   = get_chart_candles(chart_pair, chart_tf, api_key, chart_bars)
+chart_vpd  = data["vp_data"][chart_pair]
+render_candlestick_chart(
+    chart_df, chart_pair,
+    chart_vpd["poc"], chart_vpd["vah"], chart_vpd["val"],
+    chart_vpd["hvn"], chart_vpd["lvn"], chart_vpd["atr"]
+)
+st.caption("🟡 POC  🟢 VAH/VAL (Value Area)  🔵 HVN  ⬜ LVN  🟠 EMA20  🟣 EMA50  🔴 ATR band")
+st.divider()
+
 col_map,col_alerts=st.columns([3,1])
 with col_map:
     st.markdown("### 🗺 Signal Heatmap")
