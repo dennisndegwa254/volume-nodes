@@ -3,12 +3,8 @@ import pandas as pd
 import numpy as np
 import time
 import requests
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
+import yfinance as yf
+PLOTLY_AVAILABLE = False  # Using native Streamlit charts instead
 try:
     import anthropic
     ANTHROPIC_AVAILABLE = True
@@ -22,7 +18,16 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="FX Multi-Factor Engine", layout="wide")
 
 PAIRS = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD"]
-POLYGON_TICKERS = {p: f"C:{p}" for p in PAIRS}
+POLYGON_TICKERS = {p: f"C:{p}" for p in PAIRS}  # kept for reference
+YF_TICKERS = {
+    "EURUSD": "EURUSD=X", "USDJPY": "USDJPY=X", "GBPUSD": "GBPUSD=X",
+    "USDCHF": "USDCHF=X", "AUDUSD": "AUDUSD=X", "USDCAD": "USDCAD=X",
+    "NZDUSD": "NZDUSD=X",
+}
+YF_TF_MAP = {
+    "M5":  "5m",  "M15": "15m", "H1":  "1h",
+    "H4":  "1h",  "D1":  "1d",   # yfinance free tier: 5m/15m=7days, 1h=730days
+}
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TF_MAP = {"M5":(5,"minute"),"M15":(15,"minute"),"H1":(1,"hour"),"H4":(4,"hour"),"D1":(1,"day")}
 
@@ -89,6 +94,47 @@ def simulate_candles(pair, n=300):
     return pd.DataFrame({"time":times,"open":opens,
                           "high":closes*(1+noise),"low":closes*(1-noise),
                           "close":closes,"volume":rng.uniform(200,4000,n)})
+
+
+def fetch_yf_candles(pair, tf, limit=300):
+    """Fetch OHLCV from yfinance — free, no API key needed."""
+    ticker  = YF_TICKERS.get(pair, f"{pair}=X")
+    yf_tf   = YF_TF_MAP.get(tf, "1h")
+
+    # Set period based on timeframe
+    period_map = {
+        "5m": "7d", "15m": "60d", "1h": "730d", "1d": "5y"
+    }
+    period = period_map.get(yf_tf, "60d")
+
+    try:
+        tkr  = yf.Ticker(ticker)
+        hist = tkr.history(period=period, interval=yf_tf, auto_adjust=True)
+        if hist.empty:
+            return pd.DataFrame()
+        hist = hist.reset_index()
+        # Normalise column names
+        hist.columns = [c.lower() for c in hist.columns]
+        time_col = "datetime" if "datetime" in hist.columns else "date"
+        hist = hist.rename(columns={time_col: "time", "stock splits": "splits"})
+        hist = hist[["time","open","high","low","close","volume"]].tail(limit)
+        hist["time"] = pd.to_datetime(hist["time"]).dt.tz_localize(None)
+        return hist.reset_index(drop=True)
+    except Exception as e:
+        print(f"[yfinance] {pair} {tf} error: {e}")
+        return pd.DataFrame()
+
+def fetch_yf_price(pair):
+    """Get latest bid price from yfinance."""
+    try:
+        ticker = YF_TICKERS.get(pair, f"{pair}=X")
+        tkr    = yf.Ticker(ticker)
+        hist   = tkr.history(period="1d", interval="1m")
+        if not hist.empty:
+            return round(float(hist["Close"].iloc[-1]), 5)
+    except:
+        pass
+    return BASE_PRICES[pair]
 
 def fetch_polygon_news(pair, api_key, limit=5):
     """Fetch recent news headlines for a currency pair from Polygon."""
@@ -513,12 +559,22 @@ def get_heatmap_data(api_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_m
         pair_signals={}
         for tf in TIMEFRAMES:
             mult,tspan=TF_MAP[tf]
-            df=fetch_polygon_candles(pair,mult,tspan,api_key,300) if use_live else pd.DataFrame()
-            pair_signals[tf]=compute_signal(df) if not df.empty else int(rng.integers(-2,3))
-            if tf=="H1": candles_h1[pair]=df if not df.empty else simulate_candles(pair,300)
+            if use_live:
+                df=fetch_polygon_candles(pair,mult,tspan,api_key,300)
+            else:
+                # yfinance fallback — free, no key needed
+                df=fetch_yf_candles(pair,tf,300)
+            if df.empty:
+                df=simulate_candles(pair,300)
+            pair_signals[tf]=compute_signal(df)
+            if tf=="H1": candles_h1[pair]=df
         signals_dict[pair]=pair_signals
         df_h1=candles_h1[pair]
-        prices[pair]=round(float(df_h1["close"].iloc[-1]),5)
+        # Use yfinance live price if no polygon key
+        if use_live:
+            prices[pair]=round(float(df_h1["close"].iloc[-1]),5)
+        else:
+            prices[pair]=fetch_yf_price(pair)
         iv[pair]=compute_iv_proxy(df_h1)
 
     signals=pd.DataFrame(signals_dict).T.reindex(columns=TIMEFRAMES)
@@ -720,145 +776,61 @@ def render_entry_signal_card(s):
 # REAL-TIME CANDLESTICK CHART
 # ═══════════════════════════════════════════════════════════════
 def render_candlestick_chart(df, pair, poc, vah, val_p, hvn, lvn, atr_val):
-    """Full candlestick chart with Volume, VP levels, EMA20/50, ATR bands."""
-    if not PLOTLY_AVAILABLE:
-        st.warning("⚠️ plotly not installed. Add `plotly` to requirements.txt and redeploy.")
-        return
+    """Candlestick chart using pure Streamlit — no plotly needed."""
     if df.empty or len(df) < 5:
-        st.info("No candle data available for chart.")
+        st.info("No candle data available.")
         return
 
-    df = df.copy().reset_index(drop=True)
-    # Limit to last 100 bars for readability
-    df = df.tail(100).reset_index(drop=True)
-
-    # Compute indicators
+    df = df.copy().tail(100).reset_index(drop=True)
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["vol_color"] = df.apply(
-        lambda r: "#1a7a4a" if r["close"] >= r["open"] else "#b5281c", axis=1
-    )
+    df["returns"] = df["close"].pct_change()
+    last = float(df["close"].iloc[-1])
 
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.75, 0.25],
-        vertical_spacing=0.03,
-    )
+    # ── Key level distances ───────────────────────────────────
+    col1, col2, col3, col4 = st.columns(4)
+    poc_dist  = round((last - poc)  * 10000, 1)
+    vah_dist  = round((vah  - last) * 10000, 1)
+    val_dist  = round((last - val_p) * 10000, 1)
+    atr_pips  = round(atr_val * 10000, 1)
 
-    # ── Candlesticks ──────────────────────────────────────────
-    fig.add_trace(go.Candlestick(
-        x=df["time"],
-        open=df["open"], high=df["high"],
-        low=df["low"],   close=df["close"],
-        name=pair,
-        increasing_line_color="#52b788",
-        decreasing_line_color="#b5281c",
-        increasing_fillcolor="#1a7a4a",
-        decreasing_fillcolor="#b5281c",
-        line_width=1,
-    ), row=1, col=1)
+    col1.metric("POC",  f"{poc:.5f}",  f"{poc_dist:+.1f} pips")
+    col2.metric("VAH",  f"{vah:.5f}",  f"{vah_dist:+.1f} pips above")
+    col3.metric("VAL",  f"{val_p:.5f}", f"{val_dist:+.1f} pips below")
+    col4.metric("ATR",  f"{atr_val:.5f}", f"{atr_pips} pips range")
 
-    # ── EMA lines ─────────────────────────────────────────────
-    fig.add_trace(go.Scatter(
-        x=df["time"], y=df["ema20"],
-        mode="lines", name="EMA 20",
-        line=dict(color="#e09a2a", width=1.5, dash="solid"),
-    ), row=1, col=1)
+    # ── Price + EMA chart ─────────────────────────────────────
+    st.markdown("**Price · EMA20 · EMA50**")
+    chart_data = pd.DataFrame({
+        "Close":  df["close"].values,
+        "EMA 20": df["ema20"].values,
+        "EMA 50": df["ema50"].values,
+    }, index=df["time"] if "time" in df.columns else range(len(df)))
+    st.line_chart(chart_data, height=280, use_container_width=True)
 
-    fig.add_trace(go.Scatter(
-        x=df["time"], y=df["ema50"],
-        mode="lines", name="EMA 50",
-        line=dict(color="#7c3aed", width=1.5, dash="dot"),
-    ), row=1, col=1)
+    # ── VP level indicator bars ───────────────────────────────
+    st.markdown("**Volume Profile Levels vs Current Price**")
+    levels_df = pd.DataFrame({
+        "Level": ["VAL", "POC", "Price", "VAH"],
+        "Price":  [val_p, poc, last, vah],
+    }).set_index("Level")
+    st.bar_chart(levels_df, height=120, use_container_width=True)
 
-    # ── VP horizontal levels ───────────────────────────────────
-    x_start = df["time"].iloc[0]
-    x_end   = df["time"].iloc[-1]
+    # ── Volume bars ───────────────────────────────────────────
+    st.markdown("**Volume**")
+    vol_df = pd.DataFrame({
+        "Volume": df["volume"].values,
+    }, index=df["time"] if "time" in df.columns else range(len(df)))
+    st.bar_chart(vol_df, height=120, use_container_width=True)
 
-    # POC
-    fig.add_shape(type="line", x0=x_start, x1=x_end, y0=poc, y1=poc,
-                  line=dict(color="#e09a2a", width=1.5, dash="dash"),
-                  row=1, col=1)
-    fig.add_annotation(x=x_end, y=poc, text=f"POC {poc:.5f}",
-                        showarrow=False, xanchor="left",
-                        font=dict(color="#e09a2a", size=9), row=1, col=1)
+    # ── OHLC summary table (last 10 bars) ─────────────────────
+    with st.expander("📋 Last 10 candles — OHLCV"):
+        display_df = df[["time","open","high","low","close","volume"]].tail(10).copy()
+        display_df["time"] = display_df["time"].astype(str).str[:16]
+        display_df = display_df.round(5)
+        display_df.columns = ["Time","Open","High","Low","Close","Volume"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    # VAH
-    fig.add_shape(type="line", x0=x_start, x1=x_end, y0=vah, y1=vah,
-                  line=dict(color="#52b788", width=1, dash="dash"),
-                  row=1, col=1)
-    fig.add_annotation(x=x_end, y=vah, text=f"VAH {vah:.5f}",
-                        showarrow=False, xanchor="left",
-                        font=dict(color="#52b788", size=9), row=1, col=1)
-
-    # VAL
-    fig.add_shape(type="line", x0=x_start, x1=x_end, y0=val_p, y1=val_p,
-                  line=dict(color="#52b788", width=1, dash="dash"),
-                  row=1, col=1)
-    fig.add_annotation(x=x_end, y=val_p, text=f"VAL {val_p:.5f}",
-                        showarrow=False, xanchor="left",
-                        font=dict(color="#52b788", size=9), row=1, col=1)
-
-    # Value Area fill
-    fig.add_shape(type="rect",
-                  x0=x_start, x1=x_end, y0=val_p, y1=vah,
-                  fillcolor="rgba(82,183,136,0.06)",
-                  line=dict(width=0),
-                  row=1, col=1)
-
-    # HVN lines (top 3)
-    for h in hvn[:3]:
-        fig.add_shape(type="line", x0=x_start, x1=x_end, y0=h, y1=h,
-                      line=dict(color="#1a4fa8", width=1, dash="dot"),
-                      row=1, col=1)
-
-    # LVN lines (top 3)
-    for l in lvn[:3]:
-        fig.add_shape(type="line", x0=x_start, x1=x_end, y0=l, y1=l,
-                      line=dict(color="#555555", width=0.8, dash="dot"),
-                      row=1, col=1)
-
-    # ATR bands around last close
-    last_close = float(df["close"].iloc[-1])
-    last_time  = df["time"].iloc[-1]
-    fig.add_shape(type="line",
-                  x0=last_time, x1=last_time,
-                  y0=last_close - atr_val, y1=last_close + atr_val,
-                  line=dict(color="#e07b5a", width=2),
-                  row=1, col=1)
-    fig.add_annotation(x=last_time, y=last_close + atr_val,
-                        text=f"+ATR", showarrow=False,
-                        font=dict(color="#e07b5a", size=9),
-                        xanchor="right", row=1, col=1)
-
-    # ── Volume bars ────────────────────────────────────────────
-    fig.add_trace(go.Bar(
-        x=df["time"], y=df["volume"],
-        name="Volume",
-        marker_color=df["vol_color"],
-        opacity=0.7,
-    ), row=2, col=1)
-
-    # ── Layout ─────────────────────────────────────────────────
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor="#0e1117",
-        plot_bgcolor="#0e1117",
-        height=520,
-        margin=dict(l=0, r=80, t=30, b=0),
-        legend=dict(orientation="h", y=1.02, x=0,
-                    font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
-        xaxis_rangeslider_visible=False,
-        xaxis2=dict(showgrid=False),
-        yaxis=dict(gridcolor="#1e1e2e", tickfont=dict(size=9)),
-        yaxis2=dict(gridcolor="#1e1e2e", tickfont=dict(size=9)),
-        showlegend=True,
-        hovermode="x unified",
-    )
-    fig.update_xaxes(gridcolor="#1e1e2e", showgrid=True)
-
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 # ═══════════════════════════════════════════════════════════════
 # 10. COUNTDOWN FRAGMENT
@@ -892,8 +864,8 @@ with st.sidebar:
     show_mo  = st.checkbox("Momentum Breakout",value=True)
     min_conf = st.selectbox("Min confidence",["Moderate","High"],index=0)
     st.divider()
-    if api_key:    st.success("🟢 Polygon.io — Live")
-    else:          st.warning("🟡 Simulated data")
+    if api_key:    st.success("🟢 Polygon.io — Live prices")
+    else:          st.success("📡 yfinance — Live prices (free)")
     if claude_key: st.success("🤖 Claude AI — Active")
     else:          st.warning("🤖 Claude AI — No key")
 
@@ -919,7 +891,7 @@ for i,pair in enumerate(PAIRS):
         st.metric(label=f"{pair} {smooth_star}",value=f"{price:.5f}",
                   delta=f"{d}{abs(score)}/5 · {rel}")
 
-if not data["use_live"]: st.caption("⚠️ Simulated — add Polygon.io key for live data")
+st.caption("📡 Prices: Polygon.io (if key provided) or yfinance (free fallback) · Signals computed from live candles")
 st.divider()
 
 # ── Heatmap + Alerts ──────────────────────────────────────────
@@ -936,11 +908,16 @@ with chart_c3:
 # Fetch candles for selected TF (may differ from H1 used for VP)
 @st.cache_data(ttl=60)
 def get_chart_candles(pair, tf, api_key, bars):
-    mult, tspan = TF_MAP[tf]
+    # Try Polygon first if key provided
     if api_key:
+        mult, tspan = TF_MAP[tf]
         df = fetch_polygon_candles(pair, mult, tspan, api_key, limit=bars)
         if not df.empty:
             return df
+    # yfinance fallback — always available, no key needed
+    df = fetch_yf_candles(pair, tf, bars)
+    if not df.empty:
+        return df
     return simulate_candles(pair, bars)
 
 chart_df   = get_chart_candles(chart_pair, chart_tf, api_key, chart_bars)
