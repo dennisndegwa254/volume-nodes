@@ -3,5 +3,5 @@ yfinance
 pandas
 numpy
 scipy
-streamlit-autorefresh
+streamlit_autorefresh
 anthropic
