@@ -3,8 +3,12 @@ import pandas as pd
 import numpy as np
 import time
 import requests
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 try:
     import anthropic
     ANTHROPIC_AVAILABLE = True
@@ -717,6 +721,9 @@ def render_entry_signal_card(s):
 # ═══════════════════════════════════════════════════════════════
 def render_candlestick_chart(df, pair, poc, vah, val_p, hvn, lvn, atr_val):
     """Full candlestick chart with Volume, VP levels, EMA20/50, ATR bands."""
+    if not PLOTLY_AVAILABLE:
+        st.warning("⚠️ plotly not installed. Add `plotly` to requirements.txt and redeploy.")
+        return
     if df.empty or len(df) < 5:
         st.info("No candle data available for chart.")
         return
