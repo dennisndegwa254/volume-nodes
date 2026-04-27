@@ -25,7 +25,17 @@ YF_TICKERS = {
 }
 YF_TF_MAP = {
     "M5":  "5m",  "M15": "15m", "H1":  "1h",
-    "H4":  "1h",  "D1":  "1d",   # yfinance free tier: 5m/15m=7days, 1h=730days
+    "H4":  "1h",  "D1":  "1d",
+}
+
+# Twelve Data — real forex OHLCV with actual volume
+TD_TF_MAP = {
+    "M5": "5min", "M15": "15min", "H1": "1h", "H4": "4h", "D1": "1day"
+}
+TD_PAIRS = {
+    "EURUSD": "EUR/USD", "USDJPY": "USD/JPY", "GBPUSD": "GBP/USD",
+    "USDCHF": "USD/CHF", "AUDUSD": "AUD/USD", "USDCAD": "USD/CAD",
+    "NZDUSD": "NZD/USD",
 }
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TF_MAP = {"M5":(5,"minute"),"M15":(15,"minute"),"H1":(1,"hour"),"H4":(4,"hour"),"D1":(1,"day")}
@@ -154,6 +164,59 @@ def fetch_yf_price(pair):
     except:
         pass
     return BASE_PRICES[pair]
+
+def fetch_td_candles(pair, tf, td_api_key, limit=300):
+    """
+    Fetch OHLCV from Twelve Data API.
+    Free tier: 800 requests/day, real forex volume included.
+    Sign up free at: https://twelvedata.com
+    """
+    if not td_api_key:
+        return pd.DataFrame()
+    symbol   = TD_PAIRS.get(pair, pair[:3]+"/"+pair[3:])
+    interval = TD_TF_MAP.get(tf, "1h")
+    url = (f"https://api.twelvedata.com/time_series"
+           f"?symbol={symbol}&interval={interval}"
+           f"&outputsize={min(limit,5000)}&apikey={td_api_key}&format=JSON")
+    try:
+        r = requests.get(url, timeout=15)
+        d = r.json()
+        if d.get("status") == "error":
+            print(f"[TwelveData] {pair}: {d.get('message','unknown error')}")
+            return pd.DataFrame()
+        values = d.get("values", [])
+        if not values:
+            return pd.DataFrame()
+        df = pd.DataFrame(values)
+        df = df.rename(columns={"datetime":"time"})
+        df["time"]   = pd.to_datetime(df["time"])
+        df["open"]   = df["open"].astype(float)
+        df["high"]   = df["high"].astype(float)
+        df["low"]    = df["low"].astype(float)
+        df["close"]  = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float) if "volume" in df.columns else 1000.0
+        df = df[["time","open","high","low","close","volume"]]
+        df = df.sort_values("time").reset_index(drop=True)
+        return df.tail(limit)
+    except Exception as e:
+        print(f"[TwelveData] {pair} {tf} error: {e}")
+        return pd.DataFrame()
+
+def fetch_td_price(pair, td_api_key):
+    """Get real-time price from Twelve Data."""
+    if not td_api_key:
+        return None
+    symbol = TD_PAIRS.get(pair, pair[:3]+"/"+pair[3:])
+    url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={td_api_key}"
+    try:
+        r = requests.get(url, timeout=8)
+        d = r.json()
+        if "price" in d:
+            return round(float(d["price"]), 5)
+    except:
+        pass
+    return None
+
 
 def fetch_polygon_news(pair, api_key, limit=5):
     """Fetch recent news headlines for a currency pair from Polygon."""
@@ -583,18 +646,24 @@ def generate_entry_signals(df, vp, poc, vah, val, hvn, lvn, pair,
 # 8. MAIN CACHED DATA LOADER
 # ═══════════════════════════════════════════════════════════════
 @st.cache_data(ttl=900)
-def get_heatmap_data(api_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_mode):
+def get_heatmap_data(api_key, td_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_mode):
     rng=np.random.default_rng(); use_live=bool(api_key)
     signals_dict,prices,iv,candles_h1={},{},{},{}
+
+    use_td = bool(td_key)
 
     for pair in PAIRS:
         pair_signals={}
         for tf in TIMEFRAMES:
             mult,tspan=TF_MAP[tf]
             if use_live:
+                # Priority 1: Polygon.io
                 df=fetch_polygon_candles(pair,mult,tspan,api_key,300)
+            elif use_td:
+                # Priority 2: Twelve Data (real volume)
+                df=fetch_td_candles(pair,tf,td_key,300)
             else:
-                # yfinance fallback — free, no key needed
+                # Priority 3: Yahoo Finance (no volume)
                 df=fetch_yf_candles(pair,tf,300)
             if df.empty:
                 df=simulate_candles(pair,300)
@@ -602,9 +671,12 @@ def get_heatmap_data(api_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_m
             if tf=="H1": candles_h1[pair]=df
         signals_dict[pair]=pair_signals
         df_h1=candles_h1[pair]
-        # Use yfinance live price if no polygon key
+        # Live price
         if use_live:
             prices[pair]=round(float(df_h1["close"].iloc[-1]),5)
+        elif use_td:
+            p=fetch_td_price(pair,td_key)
+            prices[pair]=p if p else round(float(df_h1["close"].iloc[-1]),5)
         else:
             prices[pair]=fetch_yf_price(pair)
         iv[pair]=compute_iv_proxy(df_h1)
@@ -892,9 +964,10 @@ def countdown_bar():
 # ═══════════════════════════════════════════════════════════════
 with st.sidebar:
     st.title("⚙️ Settings")
-    api_key    = st.text_input("Polygon.io API Key",type="password",placeholder="Polygon key")
+    api_key    = st.text_input("Polygon.io API Key",type="password",placeholder="Polygon key (optional)")
+    td_key     = st.text_input("Twelve Data API Key",type="password",placeholder="Free at twelvedata.com")
     claude_key = st.text_input("Claude API Key",type="password",placeholder="Anthropic key for AI sentiment")
-    st.caption("Both keys optional — uses simulated data without them.")
+    st.caption("Twelve Data recommended — real forex volume. All keys optional.")
     st.divider()
     st.markdown("**Volume Profile**")
     vp_bins_val = st.slider("Price bins",15,60,VP_BINS,5)
@@ -907,8 +980,9 @@ with st.sidebar:
     show_mo  = st.checkbox("Momentum Breakout",value=True)
     min_conf = st.selectbox("Min confidence",["Moderate","High"],index=0)
     st.divider()
-    if api_key:    st.success("🟢 Polygon.io — Live prices")
-    else:          st.success("📡 yfinance — Live prices (free)")
+    if api_key:    st.success("🟢 Polygon.io — Live")
+    elif td_key:   st.success("🟢 Twelve Data — Real volume")
+    else:          st.info("📡 Yahoo Finance — No volume data")
     if claude_key: st.success("🤖 Claude AI — Active")
     else:          st.warning("🤖 Claude AI — No key")
 
@@ -918,7 +992,7 @@ with st.sidebar:
 st.title("💱 FX Multi-Factor Engine")
 countdown_bar()
 
-data    = get_heatmap_data(api_key,claude_key,fr_bars,vp_bins_val,va_pct_val,vp_mode)
+data    = get_heatmap_data(api_key,td_key,claude_key,fr_bars,vp_bins_val,va_pct_val,vp_mode)
 signals = data["signals"]
 
 # ── Metric cards ──────────────────────────────────────────────
@@ -934,7 +1008,7 @@ for i,pair in enumerate(PAIRS):
         st.metric(label=f"{pair} {smooth_star}",value=f"{price:.5f}",
                   delta=f"{d}{abs(score)}/5 · {rel}")
 
-st.caption("📡 Prices: Polygon.io (if key provided) or yfinance (free fallback) · Signals computed from live candles")
+st.caption("📡 Data: Polygon.io → Twelve Data (real volume) → Yahoo Finance · Signals from live candles")
 st.divider()
 
 # ── Heatmap + Alerts ──────────────────────────────────────────
@@ -950,20 +1024,25 @@ with chart_c3:
 
 # Fetch candles for selected TF (may differ from H1 used for VP)
 @st.cache_data(ttl=60)
-def get_chart_candles(pair, tf, api_key, bars):
-    # Try Polygon first if key provided
+def get_chart_candles(pair, tf, api_key, td_key, bars):
+    # Priority 1: Polygon
     if api_key:
         mult, tspan = TF_MAP[tf]
         df = fetch_polygon_candles(pair, mult, tspan, api_key, limit=bars)
         if not df.empty:
             return df
-    # yfinance fallback — always available, no key needed
+    # Priority 2: Twelve Data (real volume)
+    if td_key:
+        df = fetch_td_candles(pair, tf, td_key, bars)
+        if not df.empty:
+            return df
+    # Priority 3: Yahoo Finance
     df = fetch_yf_candles(pair, tf, bars)
     if not df.empty:
         return df
     return simulate_candles(pair, bars)
 
-chart_df   = get_chart_candles(chart_pair, chart_tf, api_key, chart_bars)
+chart_df   = get_chart_candles(chart_pair, chart_tf, api_key, td_key, chart_bars)
 chart_vpd  = data["vp_data"][chart_pair]
 render_candlestick_chart(
     chart_df, chart_pair,
