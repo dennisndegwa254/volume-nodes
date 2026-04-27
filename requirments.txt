@@ -1,5 +1,7 @@
 streamlit
+yfinance
 pandas
 numpy
-requests
+scipy
+streamlit-autorefresh
 anthropic
