@@ -405,15 +405,28 @@ def compute_volume_profile(df, bins=VP_BINS):
         for b in range(bins):
             ol=max(edges[b],bl); oh=min(edges[b+1],bh)
             if oh>ol: bin_vol[b]+=bv*((oh-ol)/rr if rr>0 else 1.0)
-    mids=(edges[:-1]+edges[1:])/2; total=bin_vol.sum() or 1
-    return pd.DataFrame({"price_mid":np.round(mids,5),"volume":np.round(bin_vol,2),
-                          "pct":np.round(bin_vol/total*100,1)}).sort_values("price_mid",ascending=False).reset_index(drop=True)
+    mids=(edges[:-1]+edges[1:])/2
+    total=bin_vol.sum()
+    if total == 0 or np.isnan(total):
+        return pd.DataFrame(columns=["price_mid","volume","pct"])
+    vp_df = pd.DataFrame({
+        "price_mid": np.round(mids, 5),
+        "volume":    np.round(bin_vol, 2),
+        "pct":       np.round(bin_vol / total * 100, 1),
+    })
+    vp_df = vp_df.dropna().replace([np.inf, -np.inf], 0)
+    return vp_df.sort_values("price_mid", ascending=False).reset_index(drop=True)
 
 def find_poc(vp):
-    return 0.0 if vp.empty else float(vp.loc[vp["volume"].idxmax(),"price_mid"])
+    if vp is None or vp.empty: return 0.0
+    vp = vp.dropna(subset=["volume","price_mid"])
+    if vp.empty: return 0.0
+    return float(vp.loc[vp["volume"].idxmax(),"price_mid"])
 
 def find_value_area(vp, pct=0.70):
-    if vp.empty: return 0.0,0.0
+    if vp is None or vp.empty: return 0.0, 0.0
+    vp = vp.dropna(subset=["volume","price_mid"])
+    if vp.empty: return 0.0, 0.0
     vs=vp.sort_values("price_mid").reset_index(drop=True)
     target=vs["volume"].sum()*pct; pi=vs["volume"].idxmax()
     lo=hi=pi; acc=vs.loc[pi,"volume"]
@@ -703,12 +716,23 @@ def smoothness_gauge(score):
             f'<span style="color:{c};font-weight:700;font-size:13px;">{score}/4 — {lbl}</span></div>')
 
 def render_vp_chart(vp, poc, vah, val_p, hvn, lvn, current_price, title):
-    if vp.empty: st.caption("No data"); return
-    max_vol=vp["volume"].max()
+    if vp is None or vp.empty:
+        st.caption("No volume profile data yet."); return
+    # Sanitise — drop NaN rows
+    vp = vp.dropna(subset=["volume","price_mid"]).reset_index(drop=True)
+    if vp.empty:
+        st.caption("Volume profile empty after cleaning."); return
+    max_vol = vp["volume"].max()
+    if max_vol == 0 or pd.isna(max_vol):
+        st.caption("Volume data is zero — waiting for data."); return
+    # Guard current_price
+    if current_price is None or current_price == 0:
+        current_price = float(vp["price_mid"].mean())
     closest_idx=(vp["price_mid"]-current_price).abs().idxmin()
     rows_html=""
     for i,r in vp.iterrows():
-        bar_w=int(r["volume"]/max_vol*160); pm=r["price_mid"]
+        vol = r["volume"] if not pd.isna(r["volume"]) else 0
+        bar_w=max(0, int(vol/max_vol*160)); pm=r["price_mid"]
         is_hvn=any(abs(pm-h)<1e-4 for h in hvn)
         is_lvn=any(abs(pm-l)<1e-4 for l in lvn)
         is_poc=abs(pm-poc)<(vp["price_mid"].max()-vp["price_mid"].min())/(len(vp)*2)
