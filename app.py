@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import time
 import requests
-import yfinance as yf
 PLOTLY_AVAILABLE = False  # Using native Streamlit charts instead
 try:
     import anthropic
@@ -97,41 +96,61 @@ def simulate_candles(pair, n=300):
 
 
 def fetch_yf_candles(pair, tf, limit=300):
-    """Fetch OHLCV from yfinance — free, no API key needed."""
-    ticker  = YF_TICKERS.get(pair, f"{pair}=X")
-    yf_tf   = YF_TF_MAP.get(tf, "1h")
+    """
+    Fetch OHLCV using Yahoo Finance CSV endpoint — pure requests, no yfinance package.
+    """
+    ticker = YF_TICKERS.get(pair, f"{pair}=X")
+    yf_tf  = YF_TF_MAP.get(tf, "1h")
 
-    # Set period based on timeframe
-    period_map = {
-        "5m": "7d", "15m": "60d", "1h": "730d", "1d": "5y"
+    interval_seconds = {
+        "5m": 300, "15m": 900, "1h": 3600, "1d": 86400
     }
-    period = period_map.get(yf_tf, "60d")
+    now      = int(datetime.utcnow().timestamp())
+    lookback = interval_seconds.get(yf_tf, 3600) * limit * 2
+    period1  = now - lookback
+    period2  = now
+
+    url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+           f"?interval={yf_tf}&period1={period1}&period2={period2}&includePrePost=false")
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     try:
-        tkr  = yf.Ticker(ticker)
-        hist = tkr.history(period=period, interval=yf_tf, auto_adjust=True)
-        if hist.empty:
+        r = requests.get(url, headers=headers, timeout=15)
+        d = r.json()
+        result = d.get("chart", {}).get("result", [])
+        if not result:
             return pd.DataFrame()
-        hist = hist.reset_index()
-        # Normalise column names
-        hist.columns = [c.lower() for c in hist.columns]
-        time_col = "datetime" if "datetime" in hist.columns else "date"
-        hist = hist.rename(columns={time_col: "time", "stock splits": "splits"})
-        hist = hist[["time","open","high","low","close","volume"]].tail(limit)
-        hist["time"] = pd.to_datetime(hist["time"]).dt.tz_localize(None)
-        return hist.reset_index(drop=True)
+        data   = result[0]
+        times  = data["timestamp"]
+        ohlcv  = data["indicators"]["quote"][0]
+        df = pd.DataFrame({
+            "time":   pd.to_datetime(times, unit="s"),
+            "open":   ohlcv["open"],
+            "high":   ohlcv["high"],
+            "low":    ohlcv["low"],
+            "close":  ohlcv["close"],
+            "volume": ohlcv["volume"],
+        }).dropna().tail(limit).reset_index(drop=True)
+        return df
     except Exception as e:
-        print(f"[yfinance] {pair} {tf} error: {e}")
+        print(f"[YF-HTTP] {pair} {tf} error: {e}")
         return pd.DataFrame()
 
 def fetch_yf_price(pair):
-    """Get latest bid price from yfinance."""
+    """Get latest price via Yahoo Finance HTTP — no package needed."""
     try:
         ticker = YF_TICKERS.get(pair, f"{pair}=X")
-        tkr    = yf.Ticker(ticker)
-        hist   = tkr.history(period="1d", interval="1m")
-        if not hist.empty:
-            return round(float(hist["Close"].iloc[-1]), 5)
+        now    = int(datetime.utcnow().timestamp())
+        url    = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+                  f"?interval=1m&period1={now-300}&period2={now}")
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+        d = r.json()
+        result = d.get("chart",{}).get("result",[])
+        if result:
+            closes = result[0]["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if closes:
+                return round(float(closes[-1]), 5)
     except:
         pass
     return BASE_PRICES[pair]
