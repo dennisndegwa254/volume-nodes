@@ -167,17 +167,24 @@ def fetch_yf_price(pair):
 
 def fetch_td_candles(pair, tf, td_api_key, limit=300):
     """
-    Fetch OHLCV from Twelve Data API.
-    Free tier: 800 requests/day, real forex volume included.
-    Sign up free at: https://twelvedata.com
+    Fetch OHLCV from Twelve Data API — always returns most recent bars.
+    Twelve Data returns newest first, so we sort ascending after fetch.
     """
     if not td_api_key:
         return pd.DataFrame()
     symbol   = TD_PAIRS.get(pair, pair[:3]+"/"+pair[3:])
     interval = TD_TF_MAP.get(tf, "1h")
+    # Add end_date = now to guarantee we always get the most recent data
+    now_str  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     url = (f"https://api.twelvedata.com/time_series"
-           f"?symbol={symbol}&interval={interval}"
-           f"&outputsize={min(limit,5000)}&apikey={td_api_key}&format=JSON")
+           f"?symbol={symbol}"
+           f"&interval={interval}"
+           f"&outputsize={min(limit, 5000)}"
+           f"&end_date={now_str}"
+           f"&timezone=UTC"
+           f"&order=ASC"
+           f"&apikey={td_api_key}"
+           f"&format=JSON")
     try:
         r = requests.get(url, timeout=15)
         d = r.json()
@@ -188,16 +195,17 @@ def fetch_td_candles(pair, tf, td_api_key, limit=300):
         if not values:
             return pd.DataFrame()
         df = pd.DataFrame(values)
-        df = df.rename(columns={"datetime":"time"})
-        df["time"]   = pd.to_datetime(df["time"])
-        df["open"]   = df["open"].astype(float)
-        df["high"]   = df["high"].astype(float)
-        df["low"]    = df["low"].astype(float)
-        df["close"]  = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float) if "volume" in df.columns else 1000.0
-        df = df[["time","open","high","low","close","volume"]]
-        df = df.sort_values("time").reset_index(drop=True)
-        return df.tail(limit)
+        df = df.rename(columns={"datetime": "time"})
+        df["time"]   = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
+        df["open"]   = pd.to_numeric(df["open"],   errors="coerce")
+        df["high"]   = pd.to_numeric(df["high"],   errors="coerce")
+        df["low"]    = pd.to_numeric(df["low"],    errors="coerce")
+        df["close"]  = pd.to_numeric(df["close"],  errors="coerce")
+        df["volume"] = pd.to_numeric(df.get("volume", pd.Series([1000.0]*len(df))), errors="coerce").fillna(1000.0)
+        df = df[["time","open","high","low","close","volume"]].dropna()
+        # Ensure sorted oldest → newest
+        df = df.sort_values("time", ascending=True).reset_index(drop=True)
+        return df.tail(limit).reset_index(drop=True)
     except Exception as e:
         print(f"[TwelveData] {pair} {tf} error: {e}")
         return pd.DataFrame()
@@ -645,7 +653,7 @@ def generate_entry_signals(df, vp, poc, vah, val, hvn, lvn, pair,
 # ═══════════════════════════════════════════════════════════════
 # 8. MAIN CACHED DATA LOADER
 # ═══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=60)
 def get_heatmap_data(api_key, td_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_mode):
     rng=np.random.default_rng(); use_live=bool(api_key)
     signals_dict,prices,iv,candles_h1={},{},{},{}
@@ -990,6 +998,11 @@ with st.sidebar:
 # 12. DASHBOARD
 # ═══════════════════════════════════════════════════════════════
 st.title("💱 FX Multi-Factor Engine")
+col_title, col_refresh = st.columns([5,1])
+with col_refresh:
+    if st.button("🔄 Refresh Now", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 countdown_bar()
 
 data    = get_heatmap_data(api_key,td_key,claude_key,fr_bars,vp_bins_val,va_pct_val,vp_mode)
@@ -1008,7 +1021,15 @@ for i,pair in enumerate(PAIRS):
         st.metric(label=f"{pair} {smooth_star}",value=f"{price:.5f}",
                   delta=f"{d}{abs(score)}/5 · {rel}")
 
-st.caption("📡 Data: Polygon.io → Twelve Data (real volume) → Yahoo Finance · Signals from live candles")
+# Show data freshness
+freshness_parts = []
+for p in PAIRS[:3]:
+    df_c = data["candles_h1"].get(p, pd.DataFrame())
+    if not df_c.empty:
+        last_t = df_c["time"].iloc[-1]
+        freshness_parts.append(f"{p}: {str(last_t)[:16]}")
+freshness_str = " · ".join(freshness_parts) if freshness_parts else "unknown"
+st.caption(f"📡 Data: Polygon.io → Twelve Data → Yahoo Finance · Last candle: {freshness_str} UTC")
 st.divider()
 
 # ── Heatmap + Alerts ──────────────────────────────────────────
@@ -1023,7 +1044,7 @@ with chart_c3:
     chart_bars  = st.slider("Bars", 50, 300, 100, 25, key="chart_bars")
 
 # Fetch candles for selected TF (may differ from H1 used for VP)
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=30)
 def get_chart_candles(pair, tf, api_key, td_key, bars):
     # Priority 1: Polygon
     if api_key:
