@@ -63,9 +63,15 @@ CORRELATION_GROUPS = {
 # 2. SESSION STATE
 # ═══════════════════════════════════════════════════════════════
 for k,v in [("last_refresh",time.time()),("refresh_count",0),
-            ("sentiment_cache",{}),("sentiment_ts",{})]:
+            ("sentiment_cache",{}),("sentiment_ts",{}),("cache_buster",0)]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Increment cache buster every minute to force fresh TD data
+current_minute = int(time.time() // 60)
+if st.session_state.get("last_minute", 0) != current_minute:
+    st.session_state.last_minute = current_minute
+    st.session_state.cache_buster = current_minute
 
 if time.time() - st.session_state.last_refresh >= REFRESH_INTERVAL:
     st.session_state.last_refresh = time.time()
@@ -174,8 +180,10 @@ def fetch_td_candles(pair, tf, td_api_key, limit=300):
         return pd.DataFrame()
     symbol   = TD_PAIRS.get(pair, pair[:3]+"/"+pair[3:])
     interval = TD_TF_MAP.get(tf, "1h")
-    # Add end_date = now to guarantee we always get the most recent data
-    now_str  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    # Force fresh data — add current minute as cache buster
+    now      = datetime.utcnow()
+    now_str  = now.strftime("%Y-%m-%d %H:%M:%S")
+    bust     = now.strftime("%Y%m%d%H%M")  # changes every minute
     url = (f"https://api.twelvedata.com/time_series"
            f"?symbol={symbol}"
            f"&interval={interval}"
@@ -184,9 +192,16 @@ def fetch_td_candles(pair, tf, td_api_key, limit=300):
            f"&timezone=UTC"
            f"&order=ASC"
            f"&apikey={td_api_key}"
-           f"&format=JSON")
+           f"&format=JSON"
+           f"&_={bust}")  # cache buster — forces fresh response
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Cache-Control": "no-cache, no-store",
+        "Pragma": "no-cache",
+    }
     try:
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, headers=headers, timeout=15)
         d = r.json()
         if d.get("status") == "error":
             print(f"[TwelveData] {pair}: {d.get('message','unknown error')}")
@@ -653,8 +668,8 @@ def generate_entry_signals(df, vp, poc, vah, val, hvn, lvn, pair,
 # ═══════════════════════════════════════════════════════════════
 # 8. MAIN CACHED DATA LOADER
 # ═══════════════════════════════════════════════════════════════
-@st.cache_data(ttl=60)
-def get_heatmap_data(api_key, td_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_mode):
+@st.cache_data(ttl=0, show_spinner=False)
+def get_heatmap_data(api_key, td_key, claude_key, fr_bars, vp_bins_val, va_pct_val, vp_mode, _cache_buster=0):
     rng=np.random.default_rng(); use_live=bool(api_key)
     signals_dict,prices,iv,candles_h1={},{},{},{}
 
@@ -1002,10 +1017,13 @@ col_title, col_refresh = st.columns([5,1])
 with col_refresh:
     if st.button("🔄 Refresh Now", use_container_width=True):
         st.cache_data.clear()
+        st.session_state.cache_buster = int(time.time())
+        st.session_state.last_minute  = -1
         st.rerun()
 countdown_bar()
 
-data    = get_heatmap_data(api_key,td_key,claude_key,fr_bars,vp_bins_val,va_pct_val,vp_mode)
+data    = get_heatmap_data(api_key,td_key,claude_key,fr_bars,vp_bins_val,va_pct_val,vp_mode,
+                             _cache_buster=st.session_state.cache_buster)
 signals = data["signals"]
 
 # ── Metric cards ──────────────────────────────────────────────
@@ -1044,8 +1062,8 @@ with chart_c3:
     chart_bars  = st.slider("Bars", 50, 300, 100, 25, key="chart_bars")
 
 # Fetch candles for selected TF (may differ from H1 used for VP)
-@st.cache_data(ttl=30)
-def get_chart_candles(pair, tf, api_key, td_key, bars):
+@st.cache_data(ttl=0, show_spinner=False)
+def get_chart_candles(pair, tf, api_key, td_key, bars, _cache_buster=0):
     # Priority 1: Polygon
     if api_key:
         mult, tspan = TF_MAP[tf]
@@ -1063,7 +1081,8 @@ def get_chart_candles(pair, tf, api_key, td_key, bars):
         return df
     return simulate_candles(pair, bars)
 
-chart_df   = get_chart_candles(chart_pair, chart_tf, api_key, td_key, chart_bars)
+chart_df   = get_chart_candles(chart_pair, chart_tf, api_key, td_key, chart_bars,
+                                   _cache_buster=st.session_state.cache_buster)
 chart_vpd  = data["vp_data"][chart_pair]
 render_candlestick_chart(
     chart_df, chart_pair,
