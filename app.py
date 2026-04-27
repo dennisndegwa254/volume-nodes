@@ -173,57 +173,95 @@ def fetch_yf_price(pair):
 
 def fetch_td_candles(pair, tf, td_api_key, limit=300):
     """
-    Fetch OHLCV from Twelve Data API — always returns most recent bars.
-    Twelve Data returns newest first, so we sort ascending after fetch.
+    Fetch OHLCV from Twelve Data — fully hardened version.
+    Fixes: URL encoding, no outputsize cap clash, correct sort.
     """
     if not td_api_key:
         return pd.DataFrame()
-    symbol   = TD_PAIRS.get(pair, pair[:3]+"/"+pair[3:])
+
+    symbol   = TD_PAIRS.get(pair, pair[:3] + "/" + pair[3:])
     interval = TD_TF_MAP.get(tf, "1h")
-    # Force fresh data — add current minute as cache buster
-    now      = datetime.utcnow()
-    now_str  = now.strftime("%Y-%m-%d %H:%M:%S")
-    bust     = now.strftime("%Y%m%d%H%M")  # changes every minute
-    url = (f"https://api.twelvedata.com/time_series"
-           f"?symbol={symbol}"
-           f"&interval={interval}"
-           f"&outputsize={min(limit, 5000)}"
-           f"&end_date={now_str}"
-           f"&timezone=UTC"
-           f"&order=ASC"
-           f"&apikey={td_api_key}"
-           f"&format=JSON"
-           f"&_={bust}")  # cache buster — forces fresh response
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Cache-Control": "no-cache, no-store",
-        "Pragma": "no-cache",
+
+    # Use requests params dict — handles URL encoding automatically
+    params = {
+        "symbol":     symbol,
+        "interval":   interval,
+        "outputsize": min(limit, 5000),
+        "timezone":   "UTC",
+        "order":      "ASC",
+        "format":     "JSON",
+        "apikey":     td_api_key,
     }
+
+    headers = {
+        "User-Agent":     "Mozilla/5.0",
+        "Cache-Control":  "no-cache, no-store, must-revalidate",
+        "Pragma":         "no-cache",
+        "Expires":        "0",
+    }
+
     try:
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(
+            "https://api.twelvedata.com/time_series",
+            params=params,
+            headers=headers,
+            timeout=20,
+        )
         d = r.json()
-        if d.get("status") == "error":
-            print(f"[TwelveData] {pair}: {d.get('message','unknown error')}")
+
+        # Handle API error
+        if d.get("status") == "error" or "code" in d:
+            msg = d.get("message", d.get("code", "unknown"))
+            print(f"[TwelveData] {pair} API error: {msg}")
             return pd.DataFrame()
+
         values = d.get("values", [])
         if not values:
+            print(f"[TwelveData] {pair} — empty values in response")
             return pd.DataFrame()
+
         df = pd.DataFrame(values)
-        df = df.rename(columns={"datetime": "time"})
-        df["time"]   = pd.to_datetime(df["time"], utc=True).dt.tz_localize(None)
-        df["open"]   = pd.to_numeric(df["open"],   errors="coerce")
-        df["high"]   = pd.to_numeric(df["high"],   errors="coerce")
-        df["low"]    = pd.to_numeric(df["low"],    errors="coerce")
-        df["close"]  = pd.to_numeric(df["close"],  errors="coerce")
-        df["volume"] = pd.to_numeric(df.get("volume", pd.Series([1000.0]*len(df))), errors="coerce").fillna(1000.0)
-        df = df[["time","open","high","low","close","volume"]].dropna()
-        # Ensure sorted oldest → newest
+
+        # Rename datetime col
+        if "datetime" in df.columns:
+            df = df.rename(columns={"datetime": "time"})
+
+        # Parse and localise time
+        df["time"] = pd.to_datetime(df["time"], utc=False)
+
+        # Numeric conversion — safe
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Volume — Twelve Data may or may not include it for forex
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+            # If volume is all zero/null, synthesise from ATR proxy
+            if df["volume"].fillna(0).sum() == 0:
+                df["volume"] = (df["high"] - df["low"]) * 1_000_000
+        else:
+            # Synthesise tick volume from bar range × scale
+            df["volume"] = (df["high"] - df["low"]) * 1_000_000
+
+        df = df[["time", "open", "high", "low", "close", "volume"]]
+        df = df.dropna(subset=["open", "high", "low", "close"])
+
+        # Ensure ascending order (oldest → newest)
         df = df.sort_values("time", ascending=True).reset_index(drop=True)
+
+        print(f"[TwelveData] {pair} {tf}: {len(df)} bars, "
+              f"latest={df['time'].iloc[-1]}, "
+              f"vol_sum={df['volume'].sum():.0f}")
+
         return df.tail(limit).reset_index(drop=True)
+
+    except requests.exceptions.Timeout:
+        print(f"[TwelveData] {pair} {tf}: Request timed out")
+        return pd.DataFrame()
     except Exception as e:
         print(f"[TwelveData] {pair} {tf} error: {e}")
         return pd.DataFrame()
+
 
 def fetch_td_price(pair, td_api_key):
     """Get real-time price from Twelve Data."""
@@ -1006,6 +1044,29 @@ with st.sidebar:
     if api_key:    st.success("🟢 Polygon.io — Live")
     elif td_key:   st.success("🟢 Twelve Data — Real volume")
     else:          st.info("📡 Yahoo Finance — No volume data")
+
+    st.divider()
+    st.markdown("**🔍 Data Debug**")
+    if td_key and st.button("Test TD Connection", use_container_width=True):
+        test_pair = "EURUSD"
+        test_sym  = "EUR/USD"
+        params = {"symbol":test_sym,"interval":"1h","outputsize":3,
+                  "timezone":"UTC","order":"ASC","format":"JSON","apikey":td_key}
+        try:
+            resp = requests.get("https://api.twelvedata.com/time_series",
+                                params=params, timeout=15)
+            d = resp.json()
+            if d.get("status") == "error":
+                st.error(f"API Error: {d.get('message','unknown')}")
+            else:
+                vals = d.get("values",[])
+                if vals:
+                    st.success(f"✅ Connected! Latest bar: {vals[-1].get('datetime','?')}")
+                    st.json(vals[-1])
+                else:
+                    st.warning(f"Connected but no data. Response: {d}")
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
     if claude_key: st.success("🤖 Claude AI — Active")
     else:          st.warning("🤖 Claude AI — No key")
 
