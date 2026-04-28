@@ -3,4 +3,4 @@ pandas
 numpy
 requests
 anthropic
-streamlit_autorefresh
+
