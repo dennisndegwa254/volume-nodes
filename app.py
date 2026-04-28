@@ -103,32 +103,77 @@ def fetch_td(pair, tf, td_key, limit=300):
         return pd.DataFrame()
 
 def fetch_yf(pair, tf, limit=300):
-    """Yahoo Finance via HTTP — free fallback (no real volume for forex)."""
-    ticker  = YF_TICKERS.get(pair,f"{pair}=X")
+    """
+    Yahoo Finance via HTTP — free fallback.
+    Uses short period (recent=True) to avoid stale cached data.
+    """
+    ticker  = YF_TICKERS.get(pair, f"{pair}=X")
     yf_tf   = {"M5":"5m","M15":"15m","H1":"1h","H4":"1h","D1":"1d"}.get(tf,"1h")
-    period  = {"5m":"7d","15m":"60d","1h":"730d","1d":"5y"}.get(yf_tf,"60d")
+
+    # Use SHORT lookback to force fresh recent data — avoids Yahoo cache
+    lookback_days = {"5m":5,"15m":50,"1h":59,"1d":700}.get(yf_tf,59)
     now     = int(datetime.utcnow().timestamp())
-    lookback= {"5m":7,"15m":60,"1h":730,"1d":1825}.get(yf_tf,60)*86400
-    url     = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-               f"?interval={yf_tf}&period1={now-lookback}&period2={now}&includePrePost=false")
-    try:
-        r = requests.get(url,headers={"User-Agent":"Mozilla/5.0","Cache-Control":"no-cache"},timeout=15)
-        d = r.json()
-        res = d.get("chart",{}).get("result",[])
-        if not res:
-            return pd.DataFrame()
-        data  = res[0]
-        times = data["timestamp"]
-        q     = data["indicators"]["quote"][0]
-        df = pd.DataFrame({"time":pd.to_datetime(times,unit="s"),
-                           "open":q["open"],"high":q["high"],
-                           "low":q["low"],"close":q["close"],
-                           "volume":q.get("volume",[0]*len(times))}).dropna()
-        df["volume"] = (df["high"]-df["low"])*1e6  # synthesise — YF forex vol is 0
-        return df.sort_values("time").tail(limit).reset_index(drop=True)
-    except Exception as e:
-        print(f"[YF] {pair} {tf}: {e}")
-        return pd.DataFrame()
+    period1 = now - lookback_days * 86400
+    period2 = now
+
+    # Try query2 first (less cached), then query1
+    for host in ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]:
+        url = (f"https://{host}/v8/finance/chart/{ticker}"
+               f"?interval={yf_tf}&period1={period1}&period2={period2}"
+               f"&includePrePost=false&corsDomain=finance.yahoo.com")
+        try:
+            r = requests.get(url,
+                             headers={
+                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                 "Accept": "application/json",
+                                 "Cache-Control": "no-cache, no-store",
+                                 "Pragma": "no-cache",
+                             },
+                             timeout=15)
+            d = r.json()
+            res = d.get("chart",{}).get("result",[])
+            if not res:
+                continue
+            data_raw = res[0]
+            times    = data_raw.get("timestamp",[])
+            q        = data_raw["indicators"]["quote"][0]
+            if not times:
+                continue
+
+            df = pd.DataFrame({
+                "time":   pd.to_datetime(times, unit="s"),
+                "open":   q.get("open",   [None]*len(times)),
+                "high":   q.get("high",   [None]*len(times)),
+                "low":    q.get("low",    [None]*len(times)),
+                "close":  q.get("close",  [None]*len(times)),
+                "volume": q.get("volume", [0]*len(times)),
+            }).dropna(subset=["open","high","low","close"])
+
+            # Validate prices are in realistic range for the pair
+            base = BASE_PRICES[pair]
+            df = df[(df["close"] > base*0.5) & (df["close"] < base*2.0)]
+
+            if df.empty:
+                continue
+
+            df["volume"] = (df["high"] - df["low"]) * 1e6
+            df = df.sort_values("time").tail(limit).reset_index(drop=True)
+
+            # Verify last bar is recent (within 48 hours for H1)
+            last_time = df["time"].iloc[-1]
+            hours_old = (datetime.utcnow() - last_time.to_pydatetime().replace(tzinfo=None)).total_seconds() / 3600
+            if hours_old > 48:
+                print(f"[YF] {pair} data is {hours_old:.0f}h old — stale, skipping")
+                continue
+
+            print(f"[YF] {pair} {tf}: {len(df)} bars, last={last_time}, price={df['close'].iloc[-1]:.5f}")
+            return df
+
+        except Exception as e:
+            print(f"[YF] {pair} {tf} from {host}: {e}")
+            continue
+
+    return pd.DataFrame()
 
 def simulate(pair, n=300):
     rng    = np.random.default_rng(abs(hash(pair))%9999)
@@ -150,29 +195,44 @@ def get_candles(pair, tf, td_key, limit=300):
     return df
 
 def get_live_price(pair, td_key):
+    base = BASE_PRICES[pair]
+
+    # Priority 1: Twelve Data real-time price
     if td_key:
         try:
-            sym = TD_PAIRS.get(pair,pair)
+            sym = TD_PAIRS.get(pair, pair)
             r   = requests.get("https://api.twelvedata.com/price",
                                params={"symbol":sym,"apikey":td_key},timeout=8)
             d   = r.json()
             if "price" in d:
-                return round(float(d["price"]),5)
+                p = float(d["price"])
+                # Validate realistic range
+                if base*0.5 < p < base*2.0:
+                    return round(p, 5)
         except: pass
-    # YF fallback
+
+    # Priority 2: Yahoo Finance real-time (1-min bar)
     try:
-        ticker = YF_TICKERS.get(pair,f"{pair}=X")
+        ticker = YF_TICKERS.get(pair, f"{pair}=X")
         now    = int(datetime.utcnow().timestamp())
-        r      = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-                              f"?interval=1m&period1={now-300}&period2={now}",
-                              headers={"User-Agent":"Mozilla/5.0"},timeout=10)
-        d = r.json()
-        res = d.get("chart",{}).get("result",[])
-        if res:
-            closes = [c for c in res[0]["indicators"]["quote"][0]["close"] if c]
-            if closes: return round(float(closes[-1]),5)
+        for host in ["query2.finance.yahoo.com","query1.finance.yahoo.com"]:
+            r = requests.get(
+                f"https://{host}/v8/finance/chart/{ticker}"
+                f"?interval=1m&period1={now-600}&period2={now}",
+                headers={"User-Agent":"Mozilla/5.0","Cache-Control":"no-cache"},
+                timeout=10)
+            d = r.json()
+            res = d.get("chart",{}).get("result",[])
+            if res:
+                closes = [c for c in res[0]["indicators"]["quote"][0].get("close",[]) if c]
+                if closes:
+                    p = float(closes[-1])
+                    if base*0.5 < p < base*2.0:
+                        return round(p, 5)
     except: pass
-    return BASE_PRICES[pair]
+
+    # Fallback: use last close from candles
+    return base
 
 def get_news(pair, td_key):
     simulated = {
