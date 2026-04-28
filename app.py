@@ -627,7 +627,11 @@ def load_data(td_key, claude_key, fr_bars, vp_bins_val, va_pct, vp_mode, _bust=0
         hvn,lvn=get_nodes(vp)
 
         headlines=get_news(pair,td_key)
-        sent=ai_sentiment(pair,headlines,claude_key)
+        # Compute confluence before calling AI so gate can check signal strength
+        tf_sigs=[get_signal(get_candles(pair,tf,td_key,200)) for tf in TIMEFRAMES]
+        pair_conf=sum(tf_sigs)
+        sent=ai_sentiment(pair,headlines,claude_key,
+                          confluence_score=pair_conf,smooth=smooth)
         smooth,checks=smoothness_score(df_raw,poc,vah,val_p,sent.get("score",0))
         tpo,tpo_mins=tpo_status(df_raw,vah,val_p)
         ldr,lag_msg=lead_lag(pair,candles)
@@ -730,19 +734,40 @@ def render_vp(vp, poc, vah, val_p, hvn, lvn, cp, title):
                 unsafe_allow_html=True)
 
 def render_sent(sent, headlines):
-    tone=sent.get("tone","Neutral"); score=sent.get("score",0)
-    interv=sent.get("intervention_risk",False); reason=sent.get("reasoning","")
-    tc={"Hawkish":"#1a7a4a","Dovish":"#b5281c","Neutral":"#666"}.get(tone,"#666")
-    sc="#1a7a4a" if score>0 else ("#b5281c" if score<0 else "#666")
-    iv_html=('<span style="background:#b5281c;color:#fff;padding:1px 8px;border-radius:3px;'
-             'font-size:10px;font-weight:700;margin-left:8px;">🚨 INTERVENTION RISK</span>' if interv else "")
+    tone   = sent.get("tone","Neutral")
+    score  = sent.get("score",0)
+    interv = sent.get("intervention_risk",False)
+    reason = sent.get("reasoning","")
+    gated  = sent.get("gated",True)
+    session= sent.get("session","")
+    calls  = sent.get("calls_today",0)
+    cached = sent.get("from_cache",False)
+
+    tc = {"Hawkish":"#1a7a4a","Dovish":"#b5281c","Neutral":"#666"}.get(tone,"#666")
+    sc = "#1a7a4a" if score>0 else ("#b5281c" if score<0 else "#666")
+    iv_html = ('<span style="background:#b5281c;color:#fff;padding:1px 8px;border-radius:3px;'
+               'font-size:10px;font-weight:700;margin-left:8px;">🚨 INTERVENTION RISK</span>'
+               if interv else "")
+
+    # Token status badge
+    if gated:
+        status_html = (f'<span style="background:#333;color:#aaa;padding:1px 7px;'
+                       f'border-radius:3px;font-size:9px;">⏸ Gated</span>')
+    elif cached:
+        status_html = (f'<span style="background:#1a3a1a;color:#52b788;padding:1px 7px;'
+                       f'border-radius:3px;font-size:9px;">♻ Cached</span>')
+    else:
+        status_html = (f'<span style="background:#1a4fa8;color:#fff;padding:1px 7px;'
+                       f'border-radius:3px;font-size:9px;">⚡ Live</span>')
+
     st.markdown(
         f'<div style="background:#12122a;border-radius:8px;padding:10px 12px;margin-bottom:6px;">'
-        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap;">'
         f'<span style="background:{tc};color:#fff;padding:2px 10px;border-radius:4px;font-size:12px;font-weight:700;">{tone}</span>'
         f'<span style="color:{sc};font-size:14px;font-weight:700;">Score {score:+d}</span>'
-        f'{iv_html}</div>'
-        f'<div style="font-size:11px;color:#bbb;font-style:italic;">{reason}</div>'
+        f'{status_html}{iv_html}</div>'
+        f'<div style="font-size:10px;color:#bbb;font-style:italic;margin-bottom:4px;">{reason}</div>'
+        f'<div style="font-size:9px;color:#555;">{session} · Calls today: {calls}/50</div>'
         f'</div>',unsafe_allow_html=True)
     with st.expander(f"Headlines ({len(headlines)})"):
         for h in headlines: st.caption(f"• {h}")
@@ -825,6 +850,31 @@ with st.sidebar:
     if claude_key: st.success("🤖 Claude AI — Active")
     else:          st.warning("🤖 Claude AI — No key")
 
+    # Token budget display
+    st.divider()
+    st.markdown("**🤖 Claude Token Budget**")
+    _reset_daily_if_needed()
+    calls = st.session_state.claude_calls_today
+    tokens = st.session_state.claude_tokens_used
+    budget_pct = calls / 50 * 100
+    budget_c = "#1a7a4a" if calls < 20 else ("#e09a2a" if calls < 40 else "#b5281c")
+    st.markdown(
+        f'<div style="background:#12122a;padding:8px;border-radius:6px;font-size:11px;">'
+        f'<div style="display:flex;justify-content:space-between;">'
+        f'<span>Calls today</span><span style="color:{budget_c};font-weight:700;">{calls}/50</span></div>'
+        f'<div style="background:#2a2a3e;border-radius:3px;height:6px;margin:4px 0;">'
+        f'<div style="width:{min(budget_pct,100):.0f}%;background:{budget_c};height:6px;border-radius:3px;"></div></div>'
+        f'<div style="color:#666;font-size:9px;">~{tokens} tokens used · Shared budget</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    # Session gate status
+    _, s_priority, s_msg = _get_session_gate()
+    gate_c = "#1a7a4a" if s_priority=="HIGH" else ("#e09a2a" if s_priority=="MED" else "#666")
+    st.markdown(f'<div style="font-size:10px;color:{gate_c};margin-top:4px;">{s_msg}</div>',
+                unsafe_allow_html=True)
+    st.caption("Gate: HIGH(≥3conf/≥2smooth) · MED(≥3+≥2) · LOW(≥4 extreme only)")
+
+    st.divider()
     # Debug connection test
     if td_key and st.button("🔍 Test TD Connection"):
         try:
