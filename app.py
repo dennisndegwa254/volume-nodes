@@ -683,11 +683,19 @@ def load_data(td_key, claude_key, fr_bars, vp_bins_val, va_pct, vp_mode, _bust=0
         hvn,lvn=get_nodes(vp)
 
         headlines=get_news(pair,td_key)
-        # Compute confluence before calling AI so gate can check signal strength
+
+        # Step 1: compute smoothness FIRST (no sentiment yet) so gate has the score
+        smooth_pre,_=smoothness_score(df_raw,poc,vah,val_p,sent_score=0)
+
+        # Step 2: compute confluence for gate check
         tf_sigs=[get_signal(get_candles(pair,tf,td_key,200)) for tf in TIMEFRAMES]
         pair_conf=sum(tf_sigs)
+
+        # Step 3: call Claude only if gate passes
         sent=ai_sentiment(pair,headlines,claude_key,
-                          confluence_score=pair_conf,smooth=smooth)
+                          confluence_score=pair_conf,smooth=smooth_pre)
+
+        # Step 4: recompute smoothness with actual sentiment score
         smooth,checks=smoothness_score(df_raw,poc,vah,val_p,sent.get("score",0))
         tpo,tpo_mins=tpo_status(df_raw,vah,val_p)
         ldr,lag_msg=lead_lag(pair,candles)
