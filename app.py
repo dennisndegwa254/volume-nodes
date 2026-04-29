@@ -77,7 +77,7 @@ SESSION_LIMITS  = {"HIGH":999,"MED":20,"LOW":5,"NONE":0}
 CACHE_DURATION  = {"HIGH":900,"MED":1800,"LOW":3600,"NONE":86400}
 
 def _reset_daily_if_needed():
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d")
     if st.session_state.claude_calls_date != today:
         st.session_state.claude_calls_date  = today
         st.session_state.claude_calls_today = 0
@@ -85,7 +85,7 @@ def _reset_daily_if_needed():
 
 def _get_session_gate():
     """Returns (allowed, priority, reason)."""
-    utc  = datetime.utcnow()
+    utc  = datetime.now(timezone.utc).replace(tzinfo=None)
     h    = utc.hour
     wday = utc.weekday()
     if wday >= 5:
@@ -168,7 +168,7 @@ def fetch_yf(pair, tf, limit=300):
 
     # Use SHORT lookback to force fresh recent data — avoids Yahoo cache
     lookback_days = {"5m":5,"15m":50,"1h":59,"1d":700}.get(yf_tf,59)
-    now     = int(datetime.utcnow().timestamp())
+    now     = int(datetime.now(timezone.utc).replace(tzinfo=None).timestamp())
     period1 = now - lookback_days * 86400
     period2 = now
 
@@ -217,7 +217,7 @@ def fetch_yf(pair, tf, limit=300):
 
             # Verify last bar is recent (within 48 hours for H1)
             last_time = df["time"].iloc[-1]
-            hours_old = (datetime.utcnow() - last_time.to_pydatetime().replace(tzinfo=None)).total_seconds() / 3600
+            hours_old = (datetime.now(timezone.utc).replace(tzinfo=None) - last_time.to_pydatetime().replace(tzinfo=None)).total_seconds() / 3600
             if hours_old > 48:
                 print(f"[YF] {pair} data is {hours_old:.0f}h old — stale, skipping")
                 continue
@@ -237,7 +237,7 @@ def simulate(pair, n=300):
     closes = base*np.cumprod(1+rng.normal(0,0.0006,n))
     noise  = rng.uniform(0.0002,0.0012,n)
     opens  = np.roll(closes,1); opens[0]=base
-    times  = [datetime.utcnow()-timedelta(hours=n-i) for i in range(n)]
+    times  = [datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(hours=n-i) for i in range(n)]
     return pd.DataFrame({"time":times,"open":opens,
                          "high":closes*(1+noise),"low":closes*(1-noise),
                          "close":closes,"volume":(closes*noise)*1e6})
@@ -270,7 +270,7 @@ def get_live_price(pair, td_key):
     # Priority 2: Yahoo Finance real-time (1-min bar)
     try:
         ticker = YF_TICKERS.get(pair, f"{pair}=X")
-        now    = int(datetime.utcnow().timestamp())
+        now    = int(datetime.now(timezone.utc).replace(tzinfo=None).timestamp())
         for host in ["query2.finance.yahoo.com","query1.finance.yahoo.com"]:
             r = requests.get(
                 f"https://{host}/v8/finance/chart/{ticker}"
@@ -490,7 +490,7 @@ def lead_lag(pair, all_candles):
 # ═══════════════════════════════════════════════════════════════
 # AI SENTIMENT (Claude)
 # ═══════════════════════════════════════════════════════════════
-def ai_sentiment(pair, headlines, claude_key):
+def ai_sentiment(pair, headlines, claude_key, confluence_score=0, smooth=0):
     """
     From screenshots: Hawkish/Dovish/Neutral + intervention_risk
     Only fires Entry Alert if AI sentiment aligns with technical trend.
