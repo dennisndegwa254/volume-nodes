@@ -5,7 +5,7 @@ import time
 import requests
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 try:
     import anthropic
@@ -488,43 +488,84 @@ def lead_lag(pair, all_candles):
     return None,None
 
 # ═══════════════════════════════════════════════════════════════
-# AI SENTIMENT (Claude)
+# AI SENTIMENT (Claude) — Token-Gated v2
 # ═══════════════════════════════════════════════════════════════
-def ai_sentiment(pair, headlines, claude_key, confluence_score=0, smooth=0):
+def ai_sentiment(pair, headlines, claude_key,
+                 confluence_score=0, smooth=0):
     """
-    From screenshots: Hawkish/Dovish/Neutral + intervention_risk
-    Only fires Entry Alert if AI sentiment aligns with technical trend.
+    Token-gated Claude call. Only fires during active sessions
+    and only for high-quality signals.
+    Parameters
+    ----------
+    confluence_score : int  sum of TF signals (-10 to +10)
+    smooth           : int  Golden Entry score (0-4)
     """
-    cache_key=pair
-    if (time.time()-st.session_state.sentiment_ts.get(cache_key,0))<1800:
-        if cache_key in st.session_state.sentiment_cache:
-            return st.session_state.sentiment_cache[cache_key]
+    _reset_daily_if_needed()
 
-    default={"tone":"Neutral","score":0,"intervention_risk":False,
-             "reasoning":"No API key — using neutral default.","pair":pair}
+    default = {"tone": "Neutral", "score": 0,
+               "intervention_risk": False,
+               "reasoning": "", "pair": pair,
+               "gated": True, "from_cache": False,
+               "session": "", "calls_today": st.session_state.claude_calls_today}
 
     if not claude_key or not ANTHROPIC_AVAILABLE:
-        if not ANTHROPIC_AVAILABLE:
-            default["reasoning"]="anthropic package not installed"
+        default["reasoning"] = ("anthropic not installed"
+                                if not ANTHROPIC_AVAILABLE else "No Claude key")
         return default
 
-    bc,qc=pair[:3],pair[3:]
-    hl="\n".join(f"- {h}" for h in headlines)
-    prompt=(f"You are a professional FX analyst. Analyze these headlines for {bc}/{qc}:\n\n{hl}\n\n"
-            f"Respond ONLY with JSON — no preamble:\n"
-            f'{{"tone":"Hawkish"|"Dovish"|"Neutral","score":-2 to +2,"intervention_risk":true|false,'
-            f'"reasoning":"one sentence max"}}')
+    # ── Session gate ──────────────────────────────────────────
+    session_ok, session_priority, session_msg = _get_session_gate()
+    default["session"] = session_msg
+
+    # ── Cache check ───────────────────────────────────────────
+    cache_key = pair
+    cache_ttl = CACHE_DURATION.get(session_priority, 1800)
+    cache_age = time.time() - st.session_state.sentiment_ts.get(cache_key, 0)
+    if cache_age < cache_ttl and cache_key in st.session_state.sentiment_cache:
+        cached = dict(st.session_state.sentiment_cache[cache_key])
+        cached["from_cache"]  = True
+        cached["calls_today"] = st.session_state.claude_calls_today
+        cached["session"]     = session_msg
+        return cached
+
+    # ── Quality gate ──────────────────────────────────────────
+    if not session_ok:
+        default["reasoning"] = session_msg
+        return default
+
+    should_call, gate_reason = _should_call_claude(
+        pair, confluence_score, smooth, session_priority)
+
+    if not should_call:
+        default["reasoning"] = f"Token gate: {gate_reason}"
+        return default
+
+    # ── Call Claude (Haiku — cheapest) ────────────────────────
+    bc, qc = pair[:3], pair[3:]
+    hl     = "; ".join(headlines[:3])
+    prompt = (f"FX analyst. {bc}/{qc} news: {hl}\n"
+              f'JSON only: {{"tone":"Hawkish|Dovish|Neutral",'
+              f'"score":-2to+2,"intervention_risk":true/false,'
+              f'"reasoning":"<10 words"}}')
     try:
-        client=anthropic.Anthropic(api_key=claude_key)
-        msg=client.messages.create(model="claude-sonnet-4-20250514",max_tokens=200,
-                                   messages=[{"role":"user","content":prompt}])
-        raw=re.sub(r"```json|```","",msg.content[0].text.strip()).strip()
-        result=json.loads(raw); result["pair"]=pair
-        st.session_state.sentiment_cache[cache_key]=result
-        st.session_state.sentiment_ts[cache_key]=time.time()
+        client = anthropic.Anthropic(api_key=claude_key)
+        msg    = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}])
+        raw    = re.sub(r"```json|```", "",
+                        msg.content[0].text.strip()).strip()
+        result = json.loads(raw)
+        result.update({"pair": pair, "gated": False,
+                       "from_cache": False, "session": session_msg,
+                       "calls_today": st.session_state.claude_calls_today})
+        st.session_state.claude_calls_today += 1
+        st.session_state.claude_tokens_used += TOKENS_PER_CALL
+        st.session_state.sentiment_cache[cache_key] = result
+        st.session_state.sentiment_ts[cache_key]    = time.time()
         return result
     except Exception as e:
-        default["reasoning"]=f"API error: {str(e)[:60]}"
+        default["reasoning"] = f"API error: {str(e)[:40]}"
         return default
 
 # ═══════════════════════════════════════════════════════════════
