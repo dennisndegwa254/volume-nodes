@@ -66,6 +66,62 @@ if st.session_state.last_minute != current_minute:
     st.session_state.cache_buster  = current_minute
 
 # ═══════════════════════════════════════════════════════════════
+# DAILY TOKEN BUDGET — defined early so sidebar can use it
+# ═══════════════════════════════════════════════════════════════
+if "claude_calls_today"  not in st.session_state: st.session_state.claude_calls_today  = 0
+if "claude_calls_date"   not in st.session_state: st.session_state.claude_calls_date   = ""
+if "claude_tokens_used"  not in st.session_state: st.session_state.claude_tokens_used  = 0
+
+TOKENS_PER_CALL = 230
+SESSION_LIMITS  = {"HIGH":999,"MED":20,"LOW":5,"NONE":0}
+CACHE_DURATION  = {"HIGH":900,"MED":1800,"LOW":3600,"NONE":86400}
+
+def _reset_daily_if_needed():
+    today = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d")
+    if st.session_state.claude_calls_date != today:
+        st.session_state.claude_calls_date  = today
+        st.session_state.claude_calls_today = 0
+        st.session_state.claude_tokens_used = 0
+
+def _get_session_gate():
+    """Returns (allowed, priority, reason)."""
+    utc  = datetime.now(timezone.utc).replace(tzinfo=None)
+    h    = utc.hour
+    wday = utc.weekday()
+    if wday >= 5:
+        return False, "NONE", "🔴 Weekend — Claude suspended"
+    if 12 <= h < 17:
+        return True,  "HIGH", "🟢 London/NY Overlap — Peak liquidity"
+    if 7  <= h < 12:
+        return True,  "MED",  "🟢 London Open"
+    if 17 <= h < 21:
+        return True,  "MED",  "🟡 NY Session"
+    return False, "LOW", "🟡 Asian/Off-hours — conserving tokens"
+
+def _should_call_claude(pair, confluence_score, smooth, session_priority):
+    """Gate valve — only call if signal is worth the tokens."""
+    _reset_daily_if_needed()
+    if st.session_state.claude_calls_today >= 50:
+        return False, f"Daily budget reached ({st.session_state.claude_calls_today}/50)"
+    if SESSION_LIMITS.get(session_priority, 0) == 0:
+        return False, "Outside active session"
+    abs_conf = abs(confluence_score)
+    if session_priority == "HIGH":
+        if abs_conf >= 3 or smooth >= 2:
+            return True, f"Peak session + conf {confluence_score:+d}/5"
+        return False, f"Signal too weak (conf {confluence_score:+d}, smooth {smooth}/4)"
+    elif session_priority == "MED":
+        if abs_conf >= 3 and smooth >= 2:
+            return True, "Good session + strong signal"
+        return False, f"Need conf≥3 AND smooth≥2 (got {abs_conf}, {smooth})"
+    elif session_priority == "LOW":
+        if abs_conf >= 4:
+            return True, "Extreme signal during off-hours"
+        return False, "Off-hours: only extreme signals (conf≥4)"
+    return False, "No session"
+
+
+# ═══════════════════════════════════════════════════════════════
 # DATA FETCHING
 # ═══════════════════════════════════════════════════════════════
 def fetch_td(pair, tf, td_key, limit=300):
@@ -103,32 +159,77 @@ def fetch_td(pair, tf, td_key, limit=300):
         return pd.DataFrame()
 
 def fetch_yf(pair, tf, limit=300):
-    """Yahoo Finance via HTTP — free fallback (no real volume for forex)."""
-    ticker  = YF_TICKERS.get(pair,f"{pair}=X")
+    """
+    Yahoo Finance via HTTP — free fallback.
+    Uses short period (recent=True) to avoid stale cached data.
+    """
+    ticker  = YF_TICKERS.get(pair, f"{pair}=X")
     yf_tf   = {"M5":"5m","M15":"15m","H1":"1h","H4":"1h","D1":"1d"}.get(tf,"1h")
-    period  = {"5m":"7d","15m":"60d","1h":"730d","1d":"5y"}.get(yf_tf,"60d")
-    now     = int(datetime.utcnow().timestamp())
-    lookback= {"5m":7,"15m":60,"1h":730,"1d":1825}.get(yf_tf,60)*86400
-    url     = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-               f"?interval={yf_tf}&period1={now-lookback}&period2={now}&includePrePost=false")
-    try:
-        r = requests.get(url,headers={"User-Agent":"Mozilla/5.0","Cache-Control":"no-cache"},timeout=15)
-        d = r.json()
-        res = d.get("chart",{}).get("result",[])
-        if not res:
-            return pd.DataFrame()
-        data  = res[0]
-        times = data["timestamp"]
-        q     = data["indicators"]["quote"][0]
-        df = pd.DataFrame({"time":pd.to_datetime(times,unit="s"),
-                           "open":q["open"],"high":q["high"],
-                           "low":q["low"],"close":q["close"],
-                           "volume":q.get("volume",[0]*len(times))}).dropna()
-        df["volume"] = (df["high"]-df["low"])*1e6  # synthesise — YF forex vol is 0
-        return df.sort_values("time").tail(limit).reset_index(drop=True)
-    except Exception as e:
-        print(f"[YF] {pair} {tf}: {e}")
-        return pd.DataFrame()
+
+    # Use SHORT lookback to force fresh recent data — avoids Yahoo cache
+    lookback_days = {"5m":5,"15m":50,"1h":59,"1d":700}.get(yf_tf,59)
+    now     = int(datetime.now(timezone.utc).replace(tzinfo=None).timestamp())
+    period1 = now - lookback_days * 86400
+    period2 = now
+
+    # Try query2 first (less cached), then query1
+    for host in ["query2.finance.yahoo.com", "query1.finance.yahoo.com"]:
+        url = (f"https://{host}/v8/finance/chart/{ticker}"
+               f"?interval={yf_tf}&period1={period1}&period2={period2}"
+               f"&includePrePost=false&corsDomain=finance.yahoo.com")
+        try:
+            r = requests.get(url,
+                             headers={
+                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                 "Accept": "application/json",
+                                 "Cache-Control": "no-cache, no-store",
+                                 "Pragma": "no-cache",
+                             },
+                             timeout=15)
+            d = r.json()
+            res = d.get("chart",{}).get("result",[])
+            if not res:
+                continue
+            data_raw = res[0]
+            times    = data_raw.get("timestamp",[])
+            q        = data_raw["indicators"]["quote"][0]
+            if not times:
+                continue
+
+            df = pd.DataFrame({
+                "time":   pd.to_datetime(times, unit="s"),
+                "open":   q.get("open",   [None]*len(times)),
+                "high":   q.get("high",   [None]*len(times)),
+                "low":    q.get("low",    [None]*len(times)),
+                "close":  q.get("close",  [None]*len(times)),
+                "volume": q.get("volume", [0]*len(times)),
+            }).dropna(subset=["open","high","low","close"])
+
+            # Validate prices are in realistic range for the pair
+            base = BASE_PRICES[pair]
+            df = df[(df["close"] > base*0.5) & (df["close"] < base*2.0)]
+
+            if df.empty:
+                continue
+
+            df["volume"] = (df["high"] - df["low"]) * 1e6
+            df = df.sort_values("time").tail(limit).reset_index(drop=True)
+
+            # Verify last bar is recent (within 48 hours for H1)
+            last_time = df["time"].iloc[-1]
+            hours_old = (datetime.now(timezone.utc).replace(tzinfo=None) - last_time.to_pydatetime().replace(tzinfo=None)).total_seconds() / 3600
+            if hours_old > 48:
+                print(f"[YF] {pair} data is {hours_old:.0f}h old — stale, skipping")
+                continue
+
+            print(f"[YF] {pair} {tf}: {len(df)} bars, last={last_time}, price={df['close'].iloc[-1]:.5f}")
+            return df
+
+        except Exception as e:
+            print(f"[YF] {pair} {tf} from {host}: {e}")
+            continue
+
+    return pd.DataFrame()
 
 def simulate(pair, n=300):
     rng    = np.random.default_rng(abs(hash(pair))%9999)
@@ -136,7 +237,7 @@ def simulate(pair, n=300):
     closes = base*np.cumprod(1+rng.normal(0,0.0006,n))
     noise  = rng.uniform(0.0002,0.0012,n)
     opens  = np.roll(closes,1); opens[0]=base
-    times  = [datetime.utcnow()-timedelta(hours=n-i) for i in range(n)]
+    times  = [datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(hours=n-i) for i in range(n)]
     return pd.DataFrame({"time":times,"open":opens,
                          "high":closes*(1+noise),"low":closes*(1-noise),
                          "close":closes,"volume":(closes*noise)*1e6})
@@ -150,29 +251,44 @@ def get_candles(pair, tf, td_key, limit=300):
     return df
 
 def get_live_price(pair, td_key):
+    base = BASE_PRICES[pair]
+
+    # Priority 1: Twelve Data real-time price
     if td_key:
         try:
-            sym = TD_PAIRS.get(pair,pair)
+            sym = TD_PAIRS.get(pair, pair)
             r   = requests.get("https://api.twelvedata.com/price",
                                params={"symbol":sym,"apikey":td_key},timeout=8)
             d   = r.json()
             if "price" in d:
-                return round(float(d["price"]),5)
+                p = float(d["price"])
+                # Validate realistic range
+                if base*0.5 < p < base*2.0:
+                    return round(p, 5)
         except: pass
-    # YF fallback
+
+    # Priority 2: Yahoo Finance real-time (1-min bar)
     try:
-        ticker = YF_TICKERS.get(pair,f"{pair}=X")
-        now    = int(datetime.utcnow().timestamp())
-        r      = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-                              f"?interval=1m&period1={now-300}&period2={now}",
-                              headers={"User-Agent":"Mozilla/5.0"},timeout=10)
-        d = r.json()
-        res = d.get("chart",{}).get("result",[])
-        if res:
-            closes = [c for c in res[0]["indicators"]["quote"][0]["close"] if c]
-            if closes: return round(float(closes[-1]),5)
+        ticker = YF_TICKERS.get(pair, f"{pair}=X")
+        now    = int(datetime.now(timezone.utc).replace(tzinfo=None).timestamp())
+        for host in ["query2.finance.yahoo.com","query1.finance.yahoo.com"]:
+            r = requests.get(
+                f"https://{host}/v8/finance/chart/{ticker}"
+                f"?interval=1m&period1={now-600}&period2={now}",
+                headers={"User-Agent":"Mozilla/5.0","Cache-Control":"no-cache"},
+                timeout=10)
+            d = r.json()
+            res = d.get("chart",{}).get("result",[])
+            if res:
+                closes = [c for c in res[0]["indicators"]["quote"][0].get("close",[]) if c]
+                if closes:
+                    p = float(closes[-1])
+                    if base*0.5 < p < base*2.0:
+                        return round(p, 5)
     except: pass
-    return BASE_PRICES[pair]
+
+    # Fallback: use last close from candles
+    return base
 
 def get_news(pair, td_key):
     simulated = {
@@ -372,43 +488,84 @@ def lead_lag(pair, all_candles):
     return None,None
 
 # ═══════════════════════════════════════════════════════════════
-# AI SENTIMENT (Claude)
+# AI SENTIMENT (Claude) — Token-Gated v2
 # ═══════════════════════════════════════════════════════════════
-def ai_sentiment(pair, headlines, claude_key):
+def ai_sentiment(pair, headlines, claude_key,
+                 confluence_score=0, smooth=0):
     """
-    From screenshots: Hawkish/Dovish/Neutral + intervention_risk
-    Only fires Entry Alert if AI sentiment aligns with technical trend.
+    Token-gated Claude call. Only fires during active sessions
+    and only for high-quality signals.
+    Parameters
+    ----------
+    confluence_score : int  sum of TF signals (-10 to +10)
+    smooth           : int  Golden Entry score (0-4)
     """
-    cache_key=pair
-    if (time.time()-st.session_state.sentiment_ts.get(cache_key,0))<1800:
-        if cache_key in st.session_state.sentiment_cache:
-            return st.session_state.sentiment_cache[cache_key]
+    _reset_daily_if_needed()
 
-    default={"tone":"Neutral","score":0,"intervention_risk":False,
-             "reasoning":"No API key — using neutral default.","pair":pair}
+    default = {"tone": "Neutral", "score": 0,
+               "intervention_risk": False,
+               "reasoning": "", "pair": pair,
+               "gated": True, "from_cache": False,
+               "session": "", "calls_today": st.session_state.claude_calls_today}
 
     if not claude_key or not ANTHROPIC_AVAILABLE:
-        if not ANTHROPIC_AVAILABLE:
-            default["reasoning"]="anthropic package not installed"
+        default["reasoning"] = ("anthropic not installed"
+                                if not ANTHROPIC_AVAILABLE else "No Claude key")
         return default
 
-    bc,qc=pair[:3],pair[3:]
-    hl="\n".join(f"- {h}" for h in headlines)
-    prompt=(f"You are a professional FX analyst. Analyze these headlines for {bc}/{qc}:\n\n{hl}\n\n"
-            f"Respond ONLY with JSON — no preamble:\n"
-            f'{{"tone":"Hawkish"|"Dovish"|"Neutral","score":-2 to +2,"intervention_risk":true|false,'
-            f'"reasoning":"one sentence max"}}')
+    # ── Session gate ──────────────────────────────────────────
+    session_ok, session_priority, session_msg = _get_session_gate()
+    default["session"] = session_msg
+
+    # ── Cache check ───────────────────────────────────────────
+    cache_key = pair
+    cache_ttl = CACHE_DURATION.get(session_priority, 1800)
+    cache_age = time.time() - st.session_state.sentiment_ts.get(cache_key, 0)
+    if cache_age < cache_ttl and cache_key in st.session_state.sentiment_cache:
+        cached = dict(st.session_state.sentiment_cache[cache_key])
+        cached["from_cache"]  = True
+        cached["calls_today"] = st.session_state.claude_calls_today
+        cached["session"]     = session_msg
+        return cached
+
+    # ── Quality gate ──────────────────────────────────────────
+    if not session_ok:
+        default["reasoning"] = session_msg
+        return default
+
+    should_call, gate_reason = _should_call_claude(
+        pair, confluence_score, smooth, session_priority)
+
+    if not should_call:
+        default["reasoning"] = f"Token gate: {gate_reason}"
+        return default
+
+    # ── Call Claude (Haiku — cheapest) ────────────────────────
+    bc, qc = pair[:3], pair[3:]
+    hl     = "; ".join(headlines[:3])
+    prompt = (f"FX analyst. {bc}/{qc} news: {hl}\n"
+              f'JSON only: {{"tone":"Hawkish|Dovish|Neutral",'
+              f'"score":-2to+2,"intervention_risk":true/false,'
+              f'"reasoning":"<10 words"}}')
     try:
-        client=anthropic.Anthropic(api_key=claude_key)
-        msg=client.messages.create(model="claude-sonnet-4-20250514",max_tokens=200,
-                                   messages=[{"role":"user","content":prompt}])
-        raw=re.sub(r"```json|```","",msg.content[0].text.strip()).strip()
-        result=json.loads(raw); result["pair"]=pair
-        st.session_state.sentiment_cache[cache_key]=result
-        st.session_state.sentiment_ts[cache_key]=time.time()
+        client = anthropic.Anthropic(api_key=claude_key)
+        msg    = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}])
+        raw    = re.sub(r"```json|```", "",
+                        msg.content[0].text.strip()).strip()
+        result = json.loads(raw)
+        result.update({"pair": pair, "gated": False,
+                       "from_cache": False, "session": session_msg,
+                       "calls_today": st.session_state.claude_calls_today})
+        st.session_state.claude_calls_today += 1
+        st.session_state.claude_tokens_used += TOKENS_PER_CALL
+        st.session_state.sentiment_cache[cache_key] = result
+        st.session_state.sentiment_ts[cache_key]    = time.time()
         return result
     except Exception as e:
-        default["reasoning"]=f"API error: {str(e)[:60]}"
+        default["reasoning"] = f"API error: {str(e)[:40]}"
         return default
 
 # ═══════════════════════════════════════════════════════════════
@@ -567,7 +724,19 @@ def load_data(td_key, claude_key, fr_bars, vp_bins_val, va_pct, vp_mode, _bust=0
         hvn,lvn=get_nodes(vp)
 
         headlines=get_news(pair,td_key)
-        sent=ai_sentiment(pair,headlines,claude_key)
+
+        # Step 1: compute smoothness FIRST (no sentiment yet) so gate has the score
+        smooth_pre,_=smoothness_score(df_raw,poc,vah,val_p,sent_score=0)
+
+        # Step 2: compute confluence for gate check
+        tf_sigs=[get_signal(get_candles(pair,tf,td_key,200)) for tf in TIMEFRAMES]
+        pair_conf=sum(tf_sigs)
+
+        # Step 3: call Claude only if gate passes
+        sent=ai_sentiment(pair,headlines,claude_key,
+                          confluence_score=pair_conf,smooth=smooth_pre)
+
+        # Step 4: recompute smoothness with actual sentiment score
         smooth,checks=smoothness_score(df_raw,poc,vah,val_p,sent.get("score",0))
         tpo,tpo_mins=tpo_status(df_raw,vah,val_p)
         ldr,lag_msg=lead_lag(pair,candles)
@@ -670,19 +839,40 @@ def render_vp(vp, poc, vah, val_p, hvn, lvn, cp, title):
                 unsafe_allow_html=True)
 
 def render_sent(sent, headlines):
-    tone=sent.get("tone","Neutral"); score=sent.get("score",0)
-    interv=sent.get("intervention_risk",False); reason=sent.get("reasoning","")
-    tc={"Hawkish":"#1a7a4a","Dovish":"#b5281c","Neutral":"#666"}.get(tone,"#666")
-    sc="#1a7a4a" if score>0 else ("#b5281c" if score<0 else "#666")
-    iv_html=('<span style="background:#b5281c;color:#fff;padding:1px 8px;border-radius:3px;'
-             'font-size:10px;font-weight:700;margin-left:8px;">🚨 INTERVENTION RISK</span>' if interv else "")
+    tone   = sent.get("tone","Neutral")
+    score  = sent.get("score",0)
+    interv = sent.get("intervention_risk",False)
+    reason = sent.get("reasoning","")
+    gated  = sent.get("gated",True)
+    session= sent.get("session","")
+    calls  = sent.get("calls_today",0)
+    cached = sent.get("from_cache",False)
+
+    tc = {"Hawkish":"#1a7a4a","Dovish":"#b5281c","Neutral":"#666"}.get(tone,"#666")
+    sc = "#1a7a4a" if score>0 else ("#b5281c" if score<0 else "#666")
+    iv_html = ('<span style="background:#b5281c;color:#fff;padding:1px 8px;border-radius:3px;'
+               'font-size:10px;font-weight:700;margin-left:8px;">🚨 INTERVENTION RISK</span>'
+               if interv else "")
+
+    # Token status badge
+    if gated:
+        status_html = (f'<span style="background:#333;color:#aaa;padding:1px 7px;'
+                       f'border-radius:3px;font-size:9px;">⏸ Gated</span>')
+    elif cached:
+        status_html = (f'<span style="background:#1a3a1a;color:#52b788;padding:1px 7px;'
+                       f'border-radius:3px;font-size:9px;">♻ Cached</span>')
+    else:
+        status_html = (f'<span style="background:#1a4fa8;color:#fff;padding:1px 7px;'
+                       f'border-radius:3px;font-size:9px;">⚡ Live</span>')
+
     st.markdown(
         f'<div style="background:#12122a;border-radius:8px;padding:10px 12px;margin-bottom:6px;">'
-        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+        f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;flex-wrap:wrap;">'
         f'<span style="background:{tc};color:#fff;padding:2px 10px;border-radius:4px;font-size:12px;font-weight:700;">{tone}</span>'
         f'<span style="color:{sc};font-size:14px;font-weight:700;">Score {score:+d}</span>'
-        f'{iv_html}</div>'
-        f'<div style="font-size:11px;color:#bbb;font-style:italic;">{reason}</div>'
+        f'{status_html}{iv_html}</div>'
+        f'<div style="font-size:10px;color:#bbb;font-style:italic;margin-bottom:4px;">{reason}</div>'
+        f'<div style="font-size:9px;color:#555;">{session} · Calls today: {calls}/50</div>'
         f'</div>',unsafe_allow_html=True)
     with st.expander(f"Headlines ({len(headlines)})"):
         for h in headlines: st.caption(f"• {h}")
@@ -765,6 +955,31 @@ with st.sidebar:
     if claude_key: st.success("🤖 Claude AI — Active")
     else:          st.warning("🤖 Claude AI — No key")
 
+    # Token budget display
+    st.divider()
+    st.markdown("**🤖 Claude Token Budget**")
+    _reset_daily_if_needed()
+    calls = st.session_state.claude_calls_today
+    tokens = st.session_state.claude_tokens_used
+    budget_pct = calls / 50 * 100
+    budget_c = "#1a7a4a" if calls < 20 else ("#e09a2a" if calls < 40 else "#b5281c")
+    st.markdown(
+        f'<div style="background:#12122a;padding:8px;border-radius:6px;font-size:11px;">'
+        f'<div style="display:flex;justify-content:space-between;">'
+        f'<span>Calls today</span><span style="color:{budget_c};font-weight:700;">{calls}/50</span></div>'
+        f'<div style="background:#2a2a3e;border-radius:3px;height:6px;margin:4px 0;">'
+        f'<div style="width:{min(budget_pct,100):.0f}%;background:{budget_c};height:6px;border-radius:3px;"></div></div>'
+        f'<div style="color:#666;font-size:9px;">~{tokens} tokens used · Shared budget</div>'
+        f'</div>', unsafe_allow_html=True)
+
+    # Session gate status
+    _, s_priority, s_msg = _get_session_gate()
+    gate_c = "#1a7a4a" if s_priority=="HIGH" else ("#e09a2a" if s_priority=="MED" else "#666")
+    st.markdown(f'<div style="font-size:10px;color:{gate_c};margin-top:4px;">{s_msg}</div>',
+                unsafe_allow_html=True)
+    st.caption("Gate: HIGH(≥3conf/≥2smooth) · MED(≥3+≥2) · LOW(≥4 extreme only)")
+
+    st.divider()
     # Debug connection test
     if td_key and st.button("🔍 Test TD Connection"):
         try:
