@@ -66,6 +66,62 @@ if st.session_state.last_minute != current_minute:
     st.session_state.cache_buster  = current_minute
 
 # ═══════════════════════════════════════════════════════════════
+# DAILY TOKEN BUDGET — defined early so sidebar can use it
+# ═══════════════════════════════════════════════════════════════
+if "claude_calls_today"  not in st.session_state: st.session_state.claude_calls_today  = 0
+if "claude_calls_date"   not in st.session_state: st.session_state.claude_calls_date   = ""
+if "claude_tokens_used"  not in st.session_state: st.session_state.claude_tokens_used  = 0
+
+TOKENS_PER_CALL = 230
+SESSION_LIMITS  = {"HIGH":999,"MED":20,"LOW":5,"NONE":0}
+CACHE_DURATION  = {"HIGH":900,"MED":1800,"LOW":3600,"NONE":86400}
+
+def _reset_daily_if_needed():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if st.session_state.claude_calls_date != today:
+        st.session_state.claude_calls_date  = today
+        st.session_state.claude_calls_today = 0
+        st.session_state.claude_tokens_used = 0
+
+def _get_session_gate():
+    """Returns (allowed, priority, reason)."""
+    utc  = datetime.utcnow()
+    h    = utc.hour
+    wday = utc.weekday()
+    if wday >= 5:
+        return False, "NONE", "🔴 Weekend — Claude suspended"
+    if 12 <= h < 17:
+        return True,  "HIGH", "🟢 London/NY Overlap — Peak liquidity"
+    if 7  <= h < 12:
+        return True,  "MED",  "🟢 London Open"
+    if 17 <= h < 21:
+        return True,  "MED",  "🟡 NY Session"
+    return False, "LOW", "🟡 Asian/Off-hours — conserving tokens"
+
+def _should_call_claude(pair, confluence_score, smooth, session_priority):
+    """Gate valve — only call if signal is worth the tokens."""
+    _reset_daily_if_needed()
+    if st.session_state.claude_calls_today >= 50:
+        return False, f"Daily budget reached ({st.session_state.claude_calls_today}/50)"
+    if SESSION_LIMITS.get(session_priority, 0) == 0:
+        return False, "Outside active session"
+    abs_conf = abs(confluence_score)
+    if session_priority == "HIGH":
+        if abs_conf >= 3 or smooth >= 2:
+            return True, f"Peak session + conf {confluence_score:+d}/5"
+        return False, f"Signal too weak (conf {confluence_score:+d}, smooth {smooth}/4)"
+    elif session_priority == "MED":
+        if abs_conf >= 3 and smooth >= 2:
+            return True, "Good session + strong signal"
+        return False, f"Need conf≥3 AND smooth≥2 (got {abs_conf}, {smooth})"
+    elif session_priority == "LOW":
+        if abs_conf >= 4:
+            return True, "Extreme signal during off-hours"
+        return False, "Off-hours: only extreme signals (conf≥4)"
+    return False, "No session"
+
+
+# ═══════════════════════════════════════════════════════════════
 # DATA FETCHING
 # ═══════════════════════════════════════════════════════════════
 def fetch_td(pair, tf, td_key, limit=300):
